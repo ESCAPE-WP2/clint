@@ -1,0 +1,4 @@
+cfg/
+used*.csv
+*.log
+env*/
