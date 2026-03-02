@@ -191,7 +191,6 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
                         rse_expression=dst,
                         lifetime=rule_lifetime,
                         source_replica_expression=src,
-                        activity='Data Challenge',
                         purge_replicas=True)
             except Exception as e:
                 err_str = str(e).replace('\n', ';;;')
@@ -262,6 +261,7 @@ def main():
     print('Loading storage dataset info...')
     storage_data = {}
     for filename in [f for f in os.listdir() if f.endswith(".lst")]:
+        print(f'Loading storage data from {filename}...')
         storage_name = os.path.splitext(filename)[0]
         storage_data[storage_name] = read_storage_csv(filename, args.big_first)
 
