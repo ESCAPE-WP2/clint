@@ -129,7 +129,7 @@ def log_injection(dataset, src, dst, user):
 
 
 def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, fudge_factor, dryrun,
-                        expiration_delay, max_injection_factor, used_datasets, rucio_client, user):
+                        expiration_delay, max_injection_factor, used_datasets, rucio_client, user, skip_validation):
     src, dst, mbps = link['src'], link['dst'], link['mbps']
 
     total_unfudged = int(125000 * mbps)  # bytes per second approx based on Mbps to Bytes/sec
@@ -144,6 +144,8 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
 
     print(f'{src}->{dst}): Average target rate: {mbps} Mbps/hour')
     print(f'{src}->{dst}): Injecting approx {injection_bytes} bytes every {injection_interval} seconds including fudge factor {fudge_factor}')
+    if skip_validation:
+        print(f'{src}->{dst}): Validation DISABLED - skipping dataset availability checks')
 
     while not event_object.is_set():
         print(f'{format_ts()}{src}->{dst} :: Selecting fresh datasets on {src} for injection')
@@ -157,7 +159,7 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
         for dataset in fresh_datasets:
             if injected_bytes + dataset['bytes'] > (injection_bytes * (1 + max_injection_factor)):
                 continue
-            if is_dataset_bad(src, dst, dataset['did'], rucio_client):
+            if not skip_validation and is_dataset_bad(src, dst, dataset['did'], rucio_client):
                 print(f'{format_ts()}Skipping bad dataset {dataset["did"]}')
                 continue
             selected_datasets.append(dataset)
@@ -233,6 +235,8 @@ def main():
                         help='Minimum seconds to wait before re-using dataset after rule expiration (default=300)')
     parser.add_argument('--dryrun', action='store_true',
                         help='Do NOT perform actual injection, simulate only')
+    parser.add_argument('--skip-validation', action='store_true',
+                        help='Skip dataset availability checks (faster but riskier - Rucio will reject invalid rules)')
     parser.add_argument('--single-thread', action='store_true',
                         help='For debugging: process only one link')
     args = parser.parse_args()
@@ -282,14 +286,14 @@ def main():
             used = {}
             run_transfer_thread(link, storage_data, args.injection_interval, args.rule_lifetime,
                                 args.fudge_factor, args.dryrun, args.expiration_delay,
-                                args.max_injection_factor, used, rucio_client, user)
+                                args.max_injection_factor, used, rucio_client, user, args.skip_validation)
     else:
         for link in config_data:
             used = {}
             thread = threading.Thread(target=run_transfer_thread,
                                       args=(link, storage_data, args.injection_interval, args.rule_lifetime,
                                             args.fudge_factor, args.dryrun, args.expiration_delay,
-                                            args.max_injection_factor, used, rucio_client, user))
+                                            args.max_injection_factor, used, rucio_client, user, args.skip_validation))
             thread.start()
             threads.append(thread)
 
