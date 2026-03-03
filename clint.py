@@ -215,6 +215,10 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
 
 def main():
     parser = argparse.ArgumentParser(description="CLINT (Controlled Load INjector Tool) - Flexible dataset injection for scientific data management")
+    parser.add_argument('--config', type=str, default='config.csv',
+                        help='Path to config CSV file (default=config.csv)')
+    parser.add_argument('--storage-dir', type=str, default='.',
+                        help='Directory containing .lst files (default=current directory)')
     parser.add_argument('--injection-interval', type=int, default=15*60,
                         help='Injection interval in seconds (default=900, 1...3600)')
     parser.add_argument('--max-injection-factor', type=float, default=0.20,
@@ -255,15 +259,21 @@ def main():
     user = rucio_client.whoami()['account']
     print(f'Using Rucio account: {user}')
 
-    print('Reading configuration...')
-    config_data = read_config_csv("config.csv")
+    print(f'Reading configuration from {args.config}...')
+    config_data = read_config_csv(args.config)
 
-    print('Loading storage dataset info...')
+    print(f'Loading storage dataset info from {args.storage_dir}...')
     storage_data = {}
-    for filename in [f for f in os.listdir() if f.endswith(".lst")]:
+    lst_files = [f for f in os.listdir(args.storage_dir) if f.endswith(".lst")]
+    if not lst_files:
+        print(f'ERROR: No .lst files found in {args.storage_dir}')
+        sys.exit(1)
+    
+    for filename in lst_files:
+        filepath = os.path.join(args.storage_dir, filename)
         print(f'Loading storage data from {filename}...')
         storage_name = os.path.splitext(filename)[0]
-        storage_data[storage_name] = read_storage_csv(filename, args.big_first)
+        storage_data[storage_name] = read_storage_csv(filepath, args.big_first)
 
     threads = []
 
