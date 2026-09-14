@@ -181,8 +181,59 @@ def sustainable_rate_mbps(pool_bytes, rule_lifetime, expiration_delay):
     return pool_bytes / cycle_seconds / 125000
 
 
+heartbeat_lock = threading.Lock()
+
+
+def write_heartbeat(src, dst, wanted_bytes, injected_bytes, cumulative_bytes, n_rules_total):
+    """
+    Merge this link's state into clint_heartbeat.json (atomic temp+replace).
+    Guarded by a lock since every link thread writes the same file.
+    """
+    key = f'{src}->{dst}'
+    entry = {
+        'last_cycle_ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'wanted_bytes': wanted_bytes,
+        'injected_bytes': injected_bytes,
+        'cumulative_bytes': cumulative_bytes,
+        'n_rules_total': n_rules_total,
+    }
+    with heartbeat_lock:
+        try:
+            with open('clint_heartbeat.json') as f:
+                data = json.load(f)
+        except (FileNotFoundError, ValueError):
+            data = {}
+        data[key] = entry
+        tmp = 'clint_heartbeat.json.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, 'clint_heartbeat.json')
+
+
+def refresh_backlog(rucio_client, pending_rules):
+    """
+    Query state for rules not yet confirmed OK; drop the ones that now are.
+    Returns (backlog_bytes, still_pending). dry-run rule ids are never
+    added to pending_rules in the first place, so --dryrun never throttles.
+    A rule whose state can't be confirmed is conservatively kept as backlog.
+    """
+    still_pending = []
+    backlog_bytes = 0
+    for entry in pending_rules:
+        try:
+            state = rucio_client.get_replication_rule(entry['rule_id']).get('state')
+        except Exception:
+            state = None
+        if state == 'OK':
+            continue
+        still_pending.append(entry)
+        backlog_bytes += entry['bytes']
+    return backlog_bytes, still_pending
+
+
 def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, fudge_factor, dryrun,
-                        expiration_delay, max_injection_factor, user, skip_validation):
+                        expiration_delay, max_injection_factor, user, skip_validation,
+                        duration=None, total_volume=None, max_backlog_factor=3.0):
     src, dst, mbps = link['src'], link['dst'], link['mbps']
 
     # One Rucio client per thread (a shared client is not guaranteed thread-safe).
@@ -208,7 +259,17 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
     if skip_validation:
         print(f'{src}->{dst}): Validation DISABLED - skipping dataset availability checks')
 
+    deadline = time.time() + duration if duration is not None else None
+    total_volume_bytes = total_volume * 1e9 if total_volume is not None else None
+    cumulative_bytes = 0
+    n_rules_total = 0
+    pending_rules = []  # [{'rule_id', 'bytes'}] for this link's rules not yet confirmed OK
+
     while not event_object.is_set():
+        if deadline is not None and time.time() >= deadline:
+            print(f'{format_ts()}{src}->{dst} :: Reached --duration, stopping')
+            break
+
         print(f'{format_ts()}{src}->{dst} :: Selecting fresh datasets on {src} for injection')
 
         freshness_cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=rule_lifetime + expiration_delay)
@@ -216,60 +277,75 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
 
         injected_bytes = 0
         selected_datasets = []
+        throttled = False
 
-        for dataset in fresh_datasets:
-            if injected_bytes + dataset['bytes'] > (injection_bytes * (1 + max_injection_factor)):
-                continue
-            if not skip_validation and is_dataset_bad(src, dst, dataset['did'], rucio_client):
-                print(f'{format_ts()}Skipping bad dataset {dataset["did"]}')
-                log_ledger_event(src, dst, 'skipped_bad', did=dataset['did'], reason='failed_validation')
-                continue
-            selected_datasets.append(dataset)
-            injected_bytes += dataset['bytes']
-            if injected_bytes >= injection_bytes:
-                break
+        if max_backlog_factor > 0:
+            backlog_bytes, pending_rules = refresh_backlog(rucio_client, pending_rules)
+            if backlog_bytes > max_backlog_factor * injection_bytes:
+                throttled = True
+                print(f'{format_ts()}{src}->{dst} :: Backlog {backlog_bytes / 1e9:.3f}GB exceeds '
+                      f'{max_backlog_factor}x this cycle\'s target -- throttling, skipping injection')
+                log_ledger_event(src, dst, 'throttled', backlog_bytes=backlog_bytes,
+                                  max_backlog_bytes=max_backlog_factor * injection_bytes)
 
-        injection_gbytes = injection_bytes / 1e9
-        injected_gbytes = injected_bytes / 1e9
+        if not throttled:
+            for dataset in fresh_datasets:
+                if injected_bytes + dataset['bytes'] > (injection_bytes * (1 + max_injection_factor)):
+                    continue
+                if not skip_validation and is_dataset_bad(src, dst, dataset['did'], rucio_client):
+                    print(f'{format_ts()}Skipping bad dataset {dataset["did"]}')
+                    log_ledger_event(src, dst, 'skipped_bad', did=dataset['did'], reason='failed_validation')
+                    continue
+                selected_datasets.append(dataset)
+                injected_bytes += dataset['bytes']
+                if injected_bytes >= injection_bytes:
+                    break
 
-        if injected_bytes == injection_bytes:
-            print(f'{format_ts()}{src}->{dst} :: Wanted {injection_gbytes:.3f}GB, injecting {injected_gbytes:.3f}GB -- EXACT MATCH')
-        elif injected_bytes > injection_bytes:
-            print(f'{format_ts()}{src}->{dst} :: Wanted {injection_gbytes:.3f}GB, injecting {injected_gbytes:.3f}GB -- OVER INJECTION')
-        else:
-            print(f'{format_ts()}{src}->{dst} :: Wanted {injection_gbytes:.3f}GB, injecting {injected_gbytes:.3f}GB -- UNDER INJECTION')
+            injection_gbytes = injection_bytes / 1e9
+            injected_gbytes = injected_bytes / 1e9
 
-        print(f'{format_ts()}{src}->{dst} :: Adding replication rules for {len(selected_datasets)} datasets')
+            if injected_bytes == injection_bytes:
+                print(f'{format_ts()}{src}->{dst} :: Wanted {injection_gbytes:.3f}GB, injecting {injected_gbytes:.3f}GB -- EXACT MATCH')
+            elif injected_bytes > injection_bytes:
+                print(f'{format_ts()}{src}->{dst} :: Wanted {injection_gbytes:.3f}GB, injecting {injected_gbytes:.3f}GB -- OVER INJECTION')
+            else:
+                print(f'{format_ts()}{src}->{dst} :: Wanted {injection_gbytes:.3f}GB, injecting {injected_gbytes:.3f}GB -- UNDER INJECTION')
 
-        for dataset in selected_datasets:
-            print(f'{format_ts()}{src}->{dst} :: Adding rule for {dataset["did"]}')
-            scope, name = dataset['did'].split(':')
-            rule_id = None
-            try:
-                if dryrun:
-                    rule_id = ["dry-run"]
-                else:
-                    rule_id = rucio_client.add_replication_rule(
-                        dids=[{'scope': scope, 'name': name}],
-                        copies=1,
-                        rse_expression=dst,
-                        lifetime=rule_lifetime,
-                        source_replica_expression=src,
-                        purge_replicas=True)
-            except Exception as e:
-                err_str = str(e).replace('\n', ';;;')
-                print(f'{format_ts()}{src}->{dst} :: Injection failed: {err_str} -- SKIPPING')
-                log_ledger_event(src, dst, 'injection_failed', did=dataset['did'], error=err_str)
-                continue
+            print(f'{format_ts()}{src}->{dst} :: Adding replication rules for {len(selected_datasets)} datasets')
 
-            if rule_id:
-                print(f'{format_ts()}{src}->{dst} :: Finished adding rule for {dataset["did"]}: {rule_id[0]}')
-                current_time = datetime.datetime.utcnow()
-                used_datasets[dataset['did']] = current_time
-                dataset['injected_at'] = current_time
-                log_injection(dataset['did'], src, dst, user)
-                log_ledger_event(src, dst, 'injected', rule_id=rule_id[0], did=dataset['did'],
-                                  bytes=dataset['bytes'], lifetime=rule_lifetime, account=user)
+            for dataset in selected_datasets:
+                print(f'{format_ts()}{src}->{dst} :: Adding rule for {dataset["did"]}')
+                scope, name = dataset['did'].split(':')
+                rule_id = None
+                try:
+                    if dryrun:
+                        rule_id = ["dry-run"]
+                    else:
+                        rule_id = rucio_client.add_replication_rule(
+                            dids=[{'scope': scope, 'name': name}],
+                            copies=1,
+                            rse_expression=dst,
+                            lifetime=rule_lifetime,
+                            source_replica_expression=src,
+                            purge_replicas=True)
+                except Exception as e:
+                    err_str = str(e).replace('\n', ';;;')
+                    print(f'{format_ts()}{src}->{dst} :: Injection failed: {err_str} -- SKIPPING')
+                    log_ledger_event(src, dst, 'injection_failed', did=dataset['did'], error=err_str)
+                    continue
+
+                if rule_id:
+                    print(f'{format_ts()}{src}->{dst} :: Finished adding rule for {dataset["did"]}: {rule_id[0]}')
+                    current_time = datetime.datetime.utcnow()
+                    used_datasets[dataset['did']] = current_time
+                    dataset['injected_at'] = current_time
+                    log_injection(dataset['did'], src, dst, user)
+                    log_ledger_event(src, dst, 'injected', rule_id=rule_id[0], did=dataset['did'],
+                                      bytes=dataset['bytes'], lifetime=rule_lifetime, account=user)
+                    cumulative_bytes += dataset['bytes']
+                    n_rules_total += 1
+                    if rule_id[0] != 'dry-run':
+                        pending_rules.append({'rule_id': rule_id[0], 'bytes': dataset['bytes']})
 
         log_ledger_event(src, dst, 'cycle', wanted_bytes=injection_bytes, injected_bytes=injected_bytes,
                           n_rules=len(selected_datasets))
@@ -278,11 +354,22 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
         # checkpoints would otherwise lose re-injection state and re-inject
         # datasets before rule_lifetime + expiration_delay has really passed.
         dump_used_datasets(used_datasets, src, dst)
+        write_heartbeat(src, dst, wanted_bytes=injection_bytes, injected_bytes=injected_bytes,
+                         cumulative_bytes=cumulative_bytes, n_rules_total=n_rules_total)
+
+        if total_volume_bytes is not None and cumulative_bytes >= total_volume_bytes:
+            print(f'{format_ts()}{src}->{dst} :: Reached --total-volume ({cumulative_bytes / 1e9:.3f}GB), stopping this link')
+            break
 
         print(f'{format_ts()}{src}->{dst} :: Sleeping for {injection_interval} seconds')
 
-        # Wait for injection interval or stop signal
-        if event_object.wait(injection_interval):
+        # Wait for injection interval, --duration deadline, or stop signal --
+        # whichever comes first, so a run stops promptly at the deadline
+        # instead of finishing out a full sleep past it.
+        wait_time = injection_interval
+        if deadline is not None:
+            wait_time = max(0, min(injection_interval, deadline - time.time()))
+        if event_object.wait(wait_time):
             break
 
     dump_used_datasets(used_datasets, src, dst)
@@ -315,6 +402,13 @@ def add_run_arguments(parser):
                         help='Skip dataset availability checks (faster but riskier - Rucio will reject invalid rules)')
     parser.add_argument('--single-thread', action='store_true',
                         help='For debugging: process only one link')
+    parser.add_argument('--duration', type=int, default=None,
+                        help='Stop injecting after this many seconds (default=unlimited)')
+    parser.add_argument('--total-volume', type=float, default=None,
+                        help='Stop a link after injecting this many GB total (default=unlimited)')
+    parser.add_argument('--max-backlog-factor', type=float, default=3.0,
+                        help='Skip a cycle if this link\'s not-yet-OK rules exceed this multiple of '
+                             'one cycle\'s injection target; 0 disables the check (default=3.0)')
     return parser
 
 
@@ -363,13 +457,17 @@ def run(args):
         for link in config_data:
             run_transfer_thread(link, storage_data, args.injection_interval, args.rule_lifetime,
                                 args.fudge_factor, args.dryrun, args.expiration_delay,
-                                args.max_injection_factor, user, args.skip_validation)
+                                args.max_injection_factor, user, args.skip_validation,
+                                duration=args.duration, total_volume=args.total_volume,
+                                max_backlog_factor=args.max_backlog_factor)
     else:
         for link in config_data:
             thread = threading.Thread(target=run_transfer_thread,
                                       args=(link, storage_data, args.injection_interval, args.rule_lifetime,
                                             args.fudge_factor, args.dryrun, args.expiration_delay,
-                                            args.max_injection_factor, user, args.skip_validation))
+                                            args.max_injection_factor, user, args.skip_validation),
+                                      kwargs={'duration': args.duration, 'total_volume': args.total_volume,
+                                              'max_backlog_factor': args.max_backlog_factor})
             thread.start()
             threads.append(thread)
 
