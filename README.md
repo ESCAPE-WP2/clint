@@ -26,7 +26,32 @@ Set up your Rucio client configuration and authentication as per [the ESCAPE doc
 
 Prepare your `config.csv` defining injection links, and dataset list files (`*.lst`).
 
-Run:
+### CLI (recommended)
+
+```
+python cli.py preflight --config config.csv --storage-dir .
+python cli.py run --injection-interval=900 --rule-lifetime=7200
+```
+
+`preflight` checks a config before you start a run: it resolves every RSE,
+computes the maximum rate the dataset pool can actually sustain given
+`--rule-lifetime`/`--expiration-delay`, compares it to what `config.csv`
+requests, and checks destination space and account quota. It exits non-zero
+on an infeasible config unless `--force` is given. Add `--json` for
+machine-readable output.
+
+More options:
+
+```
+python cli.py --help
+python cli.py run --help
+python cli.py preflight --help
+```
+
+### Direct invocation (still supported)
+
+`clint.py` remains directly runnable, for existing HTCondor submission
+scripts and anything that already depends on this exact invocation:
 
 ```
 python clint.py --injection-interval=900 --rule-lifetime=7200

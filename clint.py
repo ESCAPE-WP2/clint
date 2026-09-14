@@ -1,6 +1,8 @@
 import argparse
+import copy
 import csv
 import datetime
+import json
 import sys
 import os
 import threading
@@ -61,17 +63,59 @@ def read_storage_csv(storage_filename, big_first):
     return sorted_data
 
 
+def load_storage_data(storage_dir, big_first):
+    """
+    Load every .lst file in storage_dir into a dict keyed by storage name
+    (the .lst filename without its extension). Shared by run() and cli.py's
+    `preflight` command, which needs pool sizes without starting any threads.
+    """
+    storage_data = {}
+    lst_files = [f for f in os.listdir(storage_dir) if f.endswith(".lst")]
+    if not lst_files:
+        print(f'ERROR: No .lst files found in {storage_dir}')
+        sys.exit(1)
+
+    for filename in lst_files:
+        filepath = os.path.join(storage_dir, filename)
+        print(f'Loading storage data from {filename}...')
+        storage_name = os.path.splitext(filename)[0]
+        storage_data[storage_name] = read_storage_csv(filepath, big_first)
+
+    return storage_data
+
+
 def dump_used_datasets(used_datasets, src, dst):
     """
     Persist the state of used datasets with timestamps to disk to avoid re-injection during a single run.
-    Creates a file per source-to-destination link.
+    Creates a file per source-to-destination link. Writes atomically (temp file
+    + rename) since this now runs once per cycle, not only on shutdown.
     """
     filename = f"used_datasets_dump_{src}_to_{dst}.csv"
-    with open(filename, "w") as file:
+    tmp_filename = f"{filename}.tmp"
+    with open(tmp_filename, "w") as file:
         for dataset, timestamp in used_datasets.items():
             formatted_timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S')
             file.write(f"{dataset},{formatted_timestamp}\n")
+    os.replace(tmp_filename, filename)
     print(f"Data dumped for {src}->{dst} into {filename}")
+
+
+def ledger_filename(src, dst):
+    """One ledger file per link -- concurrent O_APPEND across links on EOS
+    FUSE is not guaranteed atomic, so links must not share a ledger file."""
+    return f"clint_ledger_{src}_to_{dst}.jsonl"
+
+
+def log_ledger_event(src, dst, event, **fields):
+    """
+    Append one JSON line to this link's ledger: {"ts", "event", ...fields}.
+    This is the join key the collector (clint_monitor.py) uses to match
+    injections to rule outcomes.
+    """
+    record = {'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'event': event}
+    record.update(fields)
+    with open(ledger_filename(src, dst), 'a') as f:
+        f.write(json.dumps(record) + '\n')
 
 
 def read_used_datasets_dump(src, dst):
@@ -128,9 +172,26 @@ def log_injection(dataset, src, dst, user):
     logger.info(f"Injected dataset={dataset} from={src} to={dst} by user={user}")
 
 
+def sustainable_rate_mbps(pool_bytes, rule_lifetime, expiration_delay):
+    """
+    Max Mbps a dataset pool can sustain, given how long a dataset takes to
+    become eligible for re-injection (rule_lifetime + expiration_delay).
+    """
+    cycle_seconds = rule_lifetime + expiration_delay
+    return pool_bytes / cycle_seconds / 125000
+
+
 def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, fudge_factor, dryrun,
-                        expiration_delay, max_injection_factor, used_datasets, rucio_client, user, skip_validation):
+                        expiration_delay, max_injection_factor, user, skip_validation):
     src, dst, mbps = link['src'], link['dst'], link['mbps']
+
+    # One Rucio client per thread (a shared client is not guaranteed thread-safe).
+    rucio_client = rucio.client.Client()
+
+    # Deep copy: two links sharing one source (the ESCAPE config has three)
+    # must not share dataset objects, or updating 'injected_at' on one link's
+    # copy makes the dataset look stale on the other link too.
+    link_datasets = copy.deepcopy(storage_data.get(src, []))
 
     total_unfudged = int(125000 * mbps)  # bytes per second approx based on Mbps to Bytes/sec
     total_bytes = total_unfudged * (1 + fudge_factor) if fudge_factor > 0 else total_unfudged
@@ -138,7 +199,7 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
 
     used_datasets = read_used_datasets_dump(src, dst)
     if used_datasets:
-        for dataset in storage_data.get(src, []):
+        for dataset in link_datasets:
             if dataset['did'] in used_datasets:
                 dataset['injected_at'] = used_datasets[dataset['did']]
 
@@ -151,7 +212,7 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
         print(f'{format_ts()}{src}->{dst} :: Selecting fresh datasets on {src} for injection')
 
         freshness_cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=rule_lifetime + expiration_delay)
-        fresh_datasets = [x for x in storage_data.get(src, []) if x['injected_at'] < freshness_cutoff]
+        fresh_datasets = [x for x in link_datasets if x['injected_at'] < freshness_cutoff]
 
         injected_bytes = 0
         selected_datasets = []
@@ -161,6 +222,7 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
                 continue
             if not skip_validation and is_dataset_bad(src, dst, dataset['did'], rucio_client):
                 print(f'{format_ts()}Skipping bad dataset {dataset["did"]}')
+                log_ledger_event(src, dst, 'skipped_bad', did=dataset['did'], reason='failed_validation')
                 continue
             selected_datasets.append(dataset)
             injected_bytes += dataset['bytes']
@@ -197,6 +259,7 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
             except Exception as e:
                 err_str = str(e).replace('\n', ';;;')
                 print(f'{format_ts()}{src}->{dst} :: Injection failed: {err_str} -- SKIPPING')
+                log_ledger_event(src, dst, 'injection_failed', did=dataset['did'], error=err_str)
                 continue
 
             if rule_id:
@@ -205,6 +268,16 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
                 used_datasets[dataset['did']] = current_time
                 dataset['injected_at'] = current_time
                 log_injection(dataset['did'], src, dst, user)
+                log_ledger_event(src, dst, 'injected', rule_id=rule_id[0], did=dataset['did'],
+                                  bytes=dataset['bytes'], lifetime=rule_lifetime, account=user)
+
+        log_ledger_event(src, dst, 'cycle', wanted_bytes=injection_bytes, injected_bytes=injected_bytes,
+                          n_rules=len(selected_datasets))
+
+        # Checkpoint every cycle, not only on shutdown -- a hard kill between
+        # checkpoints would otherwise lose re-injection state and re-inject
+        # datasets before rule_lifetime + expiration_delay has really passed.
+        dump_used_datasets(used_datasets, src, dst)
 
         print(f'{format_ts()}{src}->{dst} :: Sleeping for {injection_interval} seconds')
 
@@ -215,8 +288,11 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
     dump_used_datasets(used_datasets, src, dst)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="CLINT (Controlled Load INjector Tool) - Flexible dataset injection for scientific data management")
+def add_run_arguments(parser):
+    """
+    Add the injection-run flags to a parser (or subparser). Shared by clint.py's
+    own top-level parser and cli.py's `run` subcommand so the two can't drift.
+    """
     parser.add_argument('--config', type=str, default='config.csv',
                         help='Path to config CSV file (default=config.csv)')
     parser.add_argument('--storage-dir', type=str, default='.',
@@ -239,9 +315,14 @@ def main():
                         help='Skip dataset availability checks (faster but riskier - Rucio will reject invalid rules)')
     parser.add_argument('--single-thread', action='store_true',
                         help='For debugging: process only one link')
-    args = parser.parse_args()
+    return parser
 
-    # Validate args
+
+def validate_run_args(args):
+    """
+    Validate the run flags, printing a message and exiting 1 on the first
+    invalid value (unchanged behaviour from the original inline checks).
+    """
     if not (1 <= args.injection_interval <= 3600):
         print('Injection interval must be between 1 and 3600 seconds')
         sys.exit(1)
@@ -258,6 +339,13 @@ def main():
         print('Max injection factor must be between 0 and 1')
         sys.exit(1)
 
+
+def run(args):
+    """
+    Set up the Rucio client, load configuration and storage data, and run
+    the injection threads. Entry point shared by clint.py's main() and
+    cli.py's `run` subcommand.
+    """
     print('Setting up Rucio client...')
     rucio_client = rucio.client.Client()
     user = rucio_client.whoami()['account']
@@ -267,38 +355,34 @@ def main():
     config_data = read_config_csv(args.config)
 
     print(f'Loading storage dataset info from {args.storage_dir}...')
-    storage_data = {}
-    lst_files = [f for f in os.listdir(args.storage_dir) if f.endswith(".lst")]
-    if not lst_files:
-        print(f'ERROR: No .lst files found in {args.storage_dir}')
-        sys.exit(1)
-    
-    for filename in lst_files:
-        filepath = os.path.join(args.storage_dir, filename)
-        print(f'Loading storage data from {filename}...')
-        storage_name = os.path.splitext(filename)[0]
-        storage_data[storage_name] = read_storage_csv(filepath, args.big_first)
+    storage_data = load_storage_data(args.storage_dir, args.big_first)
 
     threads = []
 
     if args.single_thread:
         for link in config_data:
-            used = {}
             run_transfer_thread(link, storage_data, args.injection_interval, args.rule_lifetime,
                                 args.fudge_factor, args.dryrun, args.expiration_delay,
-                                args.max_injection_factor, used, rucio_client, user, args.skip_validation)
+                                args.max_injection_factor, user, args.skip_validation)
     else:
         for link in config_data:
-            used = {}
             thread = threading.Thread(target=run_transfer_thread,
                                       args=(link, storage_data, args.injection_interval, args.rule_lifetime,
                                             args.fudge_factor, args.dryrun, args.expiration_delay,
-                                            args.max_injection_factor, used, rucio_client, user, args.skip_validation))
+                                            args.max_injection_factor, user, args.skip_validation))
             thread.start()
             threads.append(thread)
 
         for thread in threads:
             thread.join()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CLINT (Controlled Load INjector Tool) - Flexible dataset injection for scientific data management")
+    add_run_arguments(parser)
+    args = parser.parse_args()
+    validate_run_args(args)
+    run(args)
 
 
 if __name__ == "__main__":
