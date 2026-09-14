@@ -1,2 +1,2 @@
-rucio-clients
+rucio-clients==38.3.0
 pytest

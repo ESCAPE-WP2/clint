@@ -94,6 +94,72 @@ class TestBuildScorecard(unittest.TestCase):
         self.assertIsNone(scorecard['dest_usage_fraction'])
 
 
+class TestClassifyCause(unittest.TestCase):
+
+    def test_target_met_when_achieved_close_to_target(self):
+        cause = monitor.classify_cause([], achieved_mbps=95, link_mbps=100)
+        self.assertEqual(cause, monitor.CAUSE_TARGET_MET)
+
+    def test_link_dead_takes_priority_over_everything(self):
+        events = [{'event': 'link_died'}]
+        cause = monitor.classify_cause(events, achieved_mbps=95, link_mbps=100)
+        self.assertEqual(cause, monitor.CAUSE_LINK_DEAD)
+
+    def test_link_disabled_maps_to_link_dead(self):
+        events = [{'event': 'link_disabled'}]
+        cause = monitor.classify_cause(events, achieved_mbps=0, link_mbps=100)
+        self.assertEqual(cause, monitor.CAUSE_LINK_DEAD)
+
+    def test_blocked_no_space_maps_to_dest_no_space(self):
+        events = [{'event': 'blocked_no_space'}]
+        cause = monitor.classify_cause(events, achieved_mbps=0, link_mbps=100)
+        self.assertEqual(cause, monitor.CAUSE_DEST_NO_SPACE)
+
+    def test_throttled_maps_to_throttled_backlog(self):
+        events = [{'event': 'throttled'}]
+        cause = monitor.classify_cause(events, achieved_mbps=10, link_mbps=100)
+        self.assertEqual(cause, monitor.CAUSE_THROTTLED_BACKLOG)
+
+    def test_only_failures_no_successes_maps_to_rucio_errors(self):
+        events = [{'event': 'injection_failed'}, {'event': 'injection_failed'}]
+        cause = monitor.classify_cause(events, achieved_mbps=0, link_mbps=100)
+        self.assertEqual(cause, monitor.CAUSE_RUCIO_ERRORS)
+
+    def test_low_achieved_with_exhausted_pool_is_pool_exhausted_not_infra_slow(self):
+        # Sustainable rate for the pool (20 Mbps) is far below the target
+        # (100 Mbps) -- this is the exact shape of the real shortfall found
+        # in this repo's own clint_injection.log.
+        cause = monitor.classify_cause([], achieved_mbps=15, link_mbps=100, sustainable_mbps=20)
+        self.assertEqual(cause, monitor.CAUSE_POOL_EXHAUSTED)
+
+    def test_low_achieved_with_healthy_pool_is_infra_slow(self):
+        cause = monitor.classify_cause([], achieved_mbps=15, link_mbps=100, sustainable_mbps=500)
+        self.assertEqual(cause, monitor.CAUSE_INFRA_SLOW)
+
+    def test_low_achieved_with_unknown_pool_is_infra_slow(self):
+        cause = monitor.classify_cause([], achieved_mbps=15, link_mbps=100, sustainable_mbps=None)
+        self.assertEqual(cause, monitor.CAUSE_INFRA_SLOW)
+
+
+class TestBuildScorecardIncludesCause(unittest.TestCase):
+
+    def test_scorecard_reads_sustainable_mbps_from_heartbeat(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        def run(tmpdir):
+            _write_ledger('SRC', 'DST', [])
+            with open('clint_heartbeat.json', 'w') as f:
+                json.dump({'SRC->DST': {'sustainable_mbps': 5}}, f)
+            rucio_client = MagicMock()
+            rucio_client.get_rse_usage.return_value = []
+            return monitor.build_scorecard(rucio_client, 'SRC', 'DST', mbps=100, window_seconds=1200, now=now)
+
+        scorecard = _run_in_tmpdir(run)
+        # achieved_mbps is 0 here (no injected events) and sustainable_mbps
+        # (5) is far below link_mbps (100) -> pool_exhausted, not infra_slow.
+        self.assertEqual(scorecard['cause'], monitor.CAUSE_POOL_EXHAUSTED)
+
+
 class TestAnomalyFlag(unittest.TestCase):
 
     LINKS = [{'src': 'SRC', 'dst': 'DST', 'mbps': 10}]

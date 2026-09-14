@@ -56,8 +56,8 @@ def read_storage_csv(storage_filename, big_first):
             try:
                 data.append({'did': row['did'], 'bytes': int(row['bytes']),
                              'injected_at': datetime.datetime.utcfromtimestamp(0)})
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'{storage_filename}: skipping unparseable row {row}: {e}', file=sys.stderr)
     print(f'{storage_filename}: Preferring big DIDs: {big_first}')
     sorted_data = sorted(data, key=lambda x: x['bytes'], reverse=big_first)
     return sorted_data
@@ -140,6 +140,17 @@ def read_used_datasets_dump(src, dst):
     return used_datasets
 
 
+def is_rse_expression(rse_string):
+    """
+    True if `rse_string` looks like a Rucio RSE expression (e.g.
+    'tier=2&country=it') rather than a plain RSE name. is_dataset_bad()
+    compares a rule's destination by exact RSE name, which silently never
+    matches an expression -- every dataset would look "not yet at
+    destination" forever. Plain RSE names don't contain these characters.
+    """
+    return any(c in rse_string for c in '&|\\()=')
+
+
 def is_dataset_bad(src, dst, did, rucio_client):
     """
     Check that the dataset exists on the source RSE with at least 80% availability
@@ -184,10 +195,16 @@ def sustainable_rate_mbps(pool_bytes, rule_lifetime, expiration_delay):
 heartbeat_lock = threading.Lock()
 
 
-def write_heartbeat(src, dst, wanted_bytes, injected_bytes, cumulative_bytes, n_rules_total):
+def write_heartbeat(src, dst, wanted_bytes, injected_bytes, cumulative_bytes, n_rules_total,
+                     eligible_pool_bytes=None, sustainable_mbps=None, state='running', cycle_duration_s=None):
     """
     Merge this link's state into clint_heartbeat.json (atomic temp+replace).
     Guarded by a lock since every link thread writes the same file.
+
+    eligible_pool_bytes/sustainable_mbps are what let a reader (human or
+    agent) tell "the pool is exhausted" apart from "the network is slow" --
+    the gap analysis found this was the single highest-value field missing
+    from the original observability plan.
     """
     key = f'{src}->{dst}'
     entry = {
@@ -196,6 +213,10 @@ def write_heartbeat(src, dst, wanted_bytes, injected_bytes, cumulative_bytes, n_
         'injected_bytes': injected_bytes,
         'cumulative_bytes': cumulative_bytes,
         'n_rules_total': n_rules_total,
+        'eligible_pool_bytes': eligible_pool_bytes,
+        'sustainable_mbps': sustainable_mbps,
+        'state': state,
+        'cycle_duration_s': cycle_duration_s,
     }
     with heartbeat_lock:
         try:
@@ -208,6 +229,38 @@ def write_heartbeat(src, dst, wanted_bytes, injected_bytes, cumulative_bytes, n_
         with open(tmp, 'w') as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, 'clint_heartbeat.json')
+
+
+CIRCUIT_BREAKER_THRESHOLD = 5  # consecutive all-failed cycles before a link quarantines itself
+
+
+def has_room_for_cycle(rucio_client, account, dst, needed_bytes):
+    """
+    True if `dst` has enough free space and `account` enough quota there
+    for `needed_bytes`. If a query itself fails (transient network issue,
+    unsupported backend), returns True -- a monitoring hiccup must not be
+    able to halt injection; only a confirmed shortfall should.
+    """
+    try:
+        for usage in rucio_client.get_rse_usage(dst):
+            if usage.get('free') is not None and usage.get('total') is not None:
+                if usage['free'] < needed_bytes:
+                    return False
+                break
+    except Exception as e:
+        print(f'Warning: could not check space on {dst}: {e}', file=sys.stderr)
+
+    try:
+        for usage in rucio_client.get_local_account_usage(account=account, rse=dst):
+            if usage.get('rse') == dst:
+                limit = usage.get('bytes_limit')
+                remaining = usage.get('bytes_remaining')
+                if limit and remaining is not None and remaining < needed_bytes:
+                    return False
+    except Exception as e:
+        print(f'Warning: could not check quota on {dst} for {account}: {e}', file=sys.stderr)
+
+    return True
 
 
 def refresh_backlog(rucio_client, pending_rules):
@@ -243,6 +296,8 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
     # must not share dataset objects, or updating 'injected_at' on one link's
     # copy makes the dataset look stale on the other link too.
     link_datasets = copy.deepcopy(storage_data.get(src, []))
+    pool_bytes_total = sum(d['bytes'] for d in link_datasets)
+    sustainable_mbps = sustainable_rate_mbps(pool_bytes_total, rule_lifetime, expiration_delay)
 
     total_unfudged = int(125000 * mbps)  # bytes per second approx based on Mbps to Bytes/sec
     total_bytes = total_unfudged * (1 + fudge_factor) if fudge_factor > 0 else total_unfudged
@@ -256,6 +311,7 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
 
     print(f'{src}->{dst}): Average target rate: {mbps} Mbps/hour')
     print(f'{src}->{dst}): Injecting approx {injection_bytes} bytes every {injection_interval} seconds including fudge factor {fudge_factor}')
+    print(f'{src}->{dst}): Pool sustains ~{sustainable_mbps:.1f} Mbps for this link\'s rule lifetime/expiration-delay cycle')
     if skip_validation:
         print(f'{src}->{dst}): Validation DISABLED - skipping dataset availability checks')
 
@@ -264,8 +320,22 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
     cumulative_bytes = 0
     n_rules_total = 0
     pending_rules = []  # [{'rule_id', 'bytes'}] for this link's rules not yet confirmed OK
+    consecutive_failed_cycles = 0
+    injection_bytes_this_cycle = 0
+    eligible_pool_bytes = 0
+
+    def write_link_heartbeat(state):
+        write_heartbeat(src, dst, wanted_bytes=injection_bytes_this_cycle, injected_bytes=injected_bytes,
+                         cumulative_bytes=cumulative_bytes, n_rules_total=n_rules_total,
+                         eligible_pool_bytes=eligible_pool_bytes, sustainable_mbps=sustainable_mbps,
+                         state=state, cycle_duration_s=round(time.time() - cycle_start_time, 3))
+
+    injected_bytes = 0  # visible to write_link_heartbeat even before the first cycle runs
+    cycle_start_time = time.time()
 
     while not event_object.is_set():
+        cycle_start_time = time.time()
+
         if deadline is not None and time.time() >= deadline:
             print(f'{format_ts()}{src}->{dst} :: Reached --duration, stopping')
             break
@@ -274,10 +344,14 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
 
         freshness_cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=rule_lifetime + expiration_delay)
         fresh_datasets = [x for x in link_datasets if x['injected_at'] < freshness_cutoff]
+        eligible_pool_bytes = sum(x['bytes'] for x in fresh_datasets)
+        injection_bytes_this_cycle = injection_bytes
 
         injected_bytes = 0
         selected_datasets = []
+        succeeded_this_cycle = 0
         throttled = False
+        blocked = False
 
         if max_backlog_factor > 0:
             backlog_bytes, pending_rules = refresh_backlog(rucio_client, pending_rules)
@@ -289,6 +363,14 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
                                   max_backlog_bytes=max_backlog_factor * injection_bytes)
 
         if not throttled:
+            needed_bytes = int(injection_bytes * (1 + max_injection_factor))
+            if not has_room_for_cycle(rucio_client, user, dst, needed_bytes):
+                blocked = True
+                print(f'{format_ts()}{src}->{dst} :: Destination {dst} lacks space/quota for this '
+                      f'cycle -- blocking, skipping injection')
+                log_ledger_event(src, dst, 'blocked_no_space', needed_bytes=needed_bytes)
+
+        if not throttled and not blocked:
             for dataset in fresh_datasets:
                 if injected_bytes + dataset['bytes'] > (injection_bytes * (1 + max_injection_factor)):
                     continue
@@ -344,35 +426,75 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
                                       bytes=dataset['bytes'], lifetime=rule_lifetime, account=user)
                     cumulative_bytes += dataset['bytes']
                     n_rules_total += 1
+                    succeeded_this_cycle += 1
                     if rule_id[0] != 'dry-run':
                         pending_rules.append({'rule_id': rule_id[0], 'bytes': dataset['bytes']})
 
+            # Circuit breaker: a cycle that tried to inject and got zero
+            # successes counts as a failure; any success resets the streak.
+            # A cycle with nothing to select (pool exhausted) is a different
+            # problem and doesn't count here.
+            if selected_datasets and succeeded_this_cycle == 0:
+                consecutive_failed_cycles += 1
+            elif succeeded_this_cycle > 0:
+                consecutive_failed_cycles = 0
+
         log_ledger_event(src, dst, 'cycle', wanted_bytes=injection_bytes, injected_bytes=injected_bytes,
-                          n_rules=len(selected_datasets))
+                          n_rules=len(selected_datasets), cycle_duration_s=round(time.time() - cycle_start_time, 3))
 
         # Checkpoint every cycle, not only on shutdown -- a hard kill between
         # checkpoints would otherwise lose re-injection state and re-inject
         # datasets before rule_lifetime + expiration_delay has really passed.
         dump_used_datasets(used_datasets, src, dst)
-        write_heartbeat(src, dst, wanted_bytes=injection_bytes, injected_bytes=injected_bytes,
-                         cumulative_bytes=cumulative_bytes, n_rules_total=n_rules_total)
+        cycle_state = 'blocked' if blocked else ('throttled' if throttled else 'running')
+        write_link_heartbeat(cycle_state)
+
+        if consecutive_failed_cycles >= CIRCUIT_BREAKER_THRESHOLD:
+            print(f'{format_ts()}{src}->{dst} :: {consecutive_failed_cycles} consecutive cycles with zero '
+                  f'successful injections -- quarantining this link')
+            log_ledger_event(src, dst, 'link_disabled', consecutive_failed_cycles=consecutive_failed_cycles)
+            write_link_heartbeat('quarantined')
+            break
 
         if total_volume_bytes is not None and cumulative_bytes >= total_volume_bytes:
             print(f'{format_ts()}{src}->{dst} :: Reached --total-volume ({cumulative_bytes / 1e9:.3f}GB), stopping this link')
+            write_link_heartbeat('stopped')
             break
 
         print(f'{format_ts()}{src}->{dst} :: Sleeping for {injection_interval} seconds')
 
-        # Wait for injection interval, --duration deadline, or stop signal --
-        # whichever comes first, so a run stops promptly at the deadline
-        # instead of finishing out a full sleep past it.
-        wait_time = injection_interval
+        # Deadline-based scheduling: wait until injection_interval seconds
+        # after this cycle STARTED, not injection_interval seconds after it
+        # finished -- otherwise cadence drifts by however long the cycle's
+        # own work (dataset validation, rule creation) took.
+        wait_time = max(0, cycle_start_time + injection_interval - time.time())
         if deadline is not None:
-            wait_time = max(0, min(injection_interval, deadline - time.time()))
+            wait_time = min(wait_time, max(0, deadline - time.time()))
         if event_object.wait(wait_time):
             break
 
     dump_used_datasets(used_datasets, src, dst)
+
+
+def _run_transfer_thread_guarded(link, outcomes, *args, **kwargs):
+    """
+    Wraps run_transfer_thread so an unhandled exception in one link's thread
+    (e.g. a malformed .lst line's ValueError) is caught and recorded instead
+    of silently killing the thread while the process looks healthy.
+    `outcomes` is a plain list; each thread appends exactly one entry, and
+    list.append is thread-safe under the GIL, so no lock is needed.
+    """
+    src, dst = link['src'], link['dst']
+    try:
+        run_transfer_thread(link, *args, **kwargs)
+        outcomes.append('stopped')
+    except Exception as e:
+        print(f'{format_ts()}{src}->{dst} :: Thread died with unhandled exception: {e}')
+        try:
+            log_ledger_event(src, dst, 'link_died', error=str(e))
+        except Exception:
+            pass  # don't let a ledger-write failure mask the original crash
+        outcomes.append('died')
 
 
 def add_run_arguments(parser):
@@ -451,6 +573,21 @@ def run(args):
     print(f'Loading storage dataset info from {args.storage_dir}...')
     storage_data = load_storage_data(args.storage_dir, args.big_first)
 
+    # Fail fast and loudly rather than silently running a no-op thread: a
+    # typo'd 'src' in config.csv used to fall through to
+    # storage_data.get(src, []) returning an empty list forever.
+    for link in config_data:
+        if not storage_data.get(link['src']):
+            print(f"ERROR: config.csv references src '{link['src']}' with no matching "
+                  f".lst file (or an empty one) in {args.storage_dir}")
+            sys.exit(1)
+        if is_rse_expression(link['dst']) and not args.skip_validation:
+            print(f"ERROR: dst '{link['dst']}' looks like a Rucio RSE expression, not a plain RSE "
+                  f"name. is_dataset_bad()'s destination check compares by exact name and would "
+                  f"never match it, silently treating every dataset as available forever. Use a "
+                  f"plain RSE name, or pass --skip-validation if this is intentional.")
+            sys.exit(1)
+
     threads = []
 
     if args.single_thread:
@@ -461,9 +598,10 @@ def run(args):
                                 duration=args.duration, total_volume=args.total_volume,
                                 max_backlog_factor=args.max_backlog_factor)
     else:
+        outcomes = []
         for link in config_data:
-            thread = threading.Thread(target=run_transfer_thread,
-                                      args=(link, storage_data, args.injection_interval, args.rule_lifetime,
+            thread = threading.Thread(target=_run_transfer_thread_guarded,
+                                      args=(link, outcomes, storage_data, args.injection_interval, args.rule_lifetime,
                                             args.fudge_factor, args.dryrun, args.expiration_delay,
                                             args.max_injection_factor, user, args.skip_validation),
                                       kwargs={'duration': args.duration, 'total_volume': args.total_volume,
@@ -473,6 +611,10 @@ def run(args):
 
         for thread in threads:
             thread.join()
+
+        if outcomes and all(o == 'died' for o in outcomes):
+            print('ERROR: every link thread died -- exiting non-zero so the scheduler notices')
+            sys.exit(1)
 
 
 def main():

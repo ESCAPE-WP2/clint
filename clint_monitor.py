@@ -32,6 +32,59 @@ ACHIEVED_RATIO_THRESHOLD = 0.6
 ACHIEVED_RATIO_WINDOW_CYCLES = 4
 RSE_USAGE_THRESHOLD = 0.90
 
+# Cause codes: a small closed vocabulary a monitoring agent can explain
+# without having to invent a story from raw numbers alone.
+CAUSE_TARGET_MET = 'target_met'
+CAUSE_POOL_EXHAUSTED = 'pool_exhausted'
+CAUSE_DEST_NO_SPACE = 'dest_no_space'
+CAUSE_RUCIO_ERRORS = 'rucio_errors'
+CAUSE_THROTTLED_BACKLOG = 'throttled_backlog'
+CAUSE_LINK_DEAD = 'link_dead'
+CAUSE_INFRA_SLOW = 'infra_slow'
+
+ACHIEVED_OK_RATIO = 0.9  # achieved/target at or above this counts as target_met
+
+
+def _read_heartbeat(heartbeat_path):
+    try:
+        with open(heartbeat_path) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def classify_cause(events, achieved_mbps, link_mbps, sustainable_mbps=None):
+    """
+    Deterministic classification of why a window looked the way it did,
+    from the ledger's own event types plus achieved-vs-target and
+    achieved-vs-sustainable-pool comparisons. checked in the order a real
+    diagnosis would: a link that died or was disabled explains everything
+    else in the window, a space block or throttle explains a shortfall
+    before guessing at "the network is slow", and only once those are ruled
+    out does the pool-vs-target comparison (the gap analysis's central
+    finding) get to decide between "the pool can't sustain this" and
+    "something upstream is just slow".
+    """
+    event_types = {e.get('event') for e in events}
+    if 'link_died' in event_types or 'link_disabled' in event_types:
+        return CAUSE_LINK_DEAD
+    if 'blocked_no_space' in event_types:
+        return CAUSE_DEST_NO_SPACE
+    if 'throttled' in event_types:
+        return CAUSE_THROTTLED_BACKLOG
+    if 'injection_failed' in event_types and 'injected' not in event_types:
+        return CAUSE_RUCIO_ERRORS
+
+    if link_mbps and achieved_mbps / link_mbps >= ACHIEVED_OK_RATIO:
+        return CAUSE_TARGET_MET
+
+    if sustainable_mbps is not None and link_mbps and sustainable_mbps < link_mbps * ACHIEVED_OK_RATIO:
+        # The pool itself can't sustain the configured target regardless of
+        # infrastructure health -- the gap analysis's central finding.
+        return CAUSE_POOL_EXHAUSTED
+
+    return CAUSE_INFRA_SLOW
+
 
 def _read_ledger_events(src, dst, window_seconds, now):
     """
@@ -87,7 +140,7 @@ def _rse_usage_fraction(rucio_client, rse):
     return None
 
 
-def build_scorecard(rucio_client, src, dst, mbps, window_seconds, now):
+def build_scorecard(rucio_client, src, dst, mbps, window_seconds, now, heartbeat_path='clint_heartbeat.json'):
     """Compute one link's scorecard from its ledger plus live Rucio rule state."""
     events = _read_ledger_events(src, dst, window_seconds, now)
     injected_events = [e for e in events if e.get('event') == 'injected']
@@ -121,6 +174,10 @@ def build_scorecard(rucio_client, src, dst, mbps, window_seconds, now):
     target_bytes = int(125000 * mbps) * window_seconds
     achieved_mbps = (completed_bytes / window_seconds / 125000) if window_seconds else 0.0
 
+    heartbeat = _read_heartbeat(heartbeat_path)
+    sustainable_mbps = heartbeat.get(f'{src}->{dst}', {}).get('sustainable_mbps')
+    cause = classify_cause(events, achieved_mbps, mbps, sustainable_mbps)
+
     return {
         'ts': now.isoformat(),
         'src': src,
@@ -134,6 +191,7 @@ def build_scorecard(rucio_client, src, dst, mbps, window_seconds, now):
         'stuck_rule_ids': stuck_rule_ids,
         'achieved_mbps': achieved_mbps,
         'dest_usage_fraction': _rse_usage_fraction(rucio_client, dst),
+        'cause': cause,
     }
 
 
@@ -233,6 +291,9 @@ def main(argv=None):
                         help='Scorecard output file (default=scorecards.jsonl)')
     parser.add_argument('--anomaly-flag', type=str, default='ANOMALY.flag',
                         help='Anomaly flag file, written/cleared each run (default=ANOMALY.flag)')
+    parser.add_argument('--heartbeat', type=str, default='clint_heartbeat.json',
+                        help="CLINT's heartbeat file, read for each link's sustainable_mbps "
+                             "(default=clint_heartbeat.json)")
     args = parser.parse_args(argv)
 
     # Never crash the schedule: every failure path below logs to stderr and
@@ -255,7 +316,7 @@ def main(argv=None):
         for link in links:
             try:
                 scorecard = build_scorecard(rucio_client, link['src'], link['dst'], link['mbps'],
-                                             args.window, now)
+                                             args.window, now, heartbeat_path=args.heartbeat)
                 append_scorecard(args.out, scorecard)
             except Exception as e:
                 print(f"clint_monitor: failed to build scorecard for {link['src']}->{link['dst']}: {e}",

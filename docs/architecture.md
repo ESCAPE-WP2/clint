@@ -16,10 +16,9 @@ The architecture of CLINT is largely inspired by the [`dc_inject`](https://gitla
 - Injects data respecting configured throughput targets and limits, including fudge factors and maximum over-injection thresholds.
 - Supports single-threaded mode for debugging.
 
-### 3. Storage Backend Interface
+### 3. Storage Backend
 
-- Currently implemented with Rucio client to interact with datasets and replication rules.
-- Abstracts dataset presence and replication rule creation to enable potential future support for other storage systems.
+- Talks to Rucio directly via `rucio.client.Client()` for dataset presence and replication rule creation. There is no abstraction layer, and CLINT has exactly one backend today; adding one is worth doing if and when a second backend is actually needed, not speculatively.
 
 ### 4. Monitoring and Logging
 
