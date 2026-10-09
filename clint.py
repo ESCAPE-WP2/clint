@@ -10,6 +10,7 @@ import time
 import signal
 import logging
 import rucio.client
+from rucio.common.exception import RuleNotFound
 
 # Setup monitoring logger to track injection activity
 logger = logging.getLogger("clint_monitor")
@@ -263,21 +264,32 @@ def has_room_for_cycle(rucio_client, account, dst, needed_bytes):
     return True
 
 
-def refresh_backlog(rucio_client, pending_rules):
+def refresh_backlog(rucio_client, pending_rules, src=None, dst=None):
     """
     Query state for rules not yet confirmed OK; drop the ones that now are.
     Returns (backlog_bytes, still_pending). dry-run rule ids are never
     added to pending_rules in the first place, so --dryrun never throttles.
     A rule whose state can't be confirmed is conservatively kept as backlog.
+
+    A rule that Rucio no longer knows (RuleNotFound) has expired and been removed
+    by the cleaner daemon; it is not backlog any more. With src and dst given, the
+    outcome is written to the link's ledger, so that clint_monitor.py can still
+    tell a rule that finished (rule_ok) from one that vanished unseen (rule_gone).
     """
     still_pending = []
     backlog_bytes = 0
     for entry in pending_rules:
         try:
             state = rucio_client.get_replication_rule(entry['rule_id']).get('state')
+        except RuleNotFound:
+            if src and dst:
+                log_ledger_event(src, dst, 'rule_gone', rule_id=entry['rule_id'], bytes=entry['bytes'])
+            continue
         except Exception:
             state = None
         if state == 'OK':
+            if src and dst:
+                log_ledger_event(src, dst, 'rule_ok', rule_id=entry['rule_id'], bytes=entry['bytes'])
             continue
         still_pending.append(entry)
         backlog_bytes += entry['bytes']
@@ -353,8 +365,9 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
         throttled = False
         blocked = False
 
+        # Refresh every cycle, also with the throttle off: this is what writes rule_ok to the ledger.
+        backlog_bytes, pending_rules = refresh_backlog(rucio_client, pending_rules, src, dst)
         if max_backlog_factor > 0:
-            backlog_bytes, pending_rules = refresh_backlog(rucio_client, pending_rules)
             if backlog_bytes > max_backlog_factor * injection_bytes:
                 throttled = True
                 print(f'{format_ts()}{src}->{dst} :: Backlog {backlog_bytes / 1e9:.3f}GB exceeds '

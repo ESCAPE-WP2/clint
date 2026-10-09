@@ -19,11 +19,13 @@ import os
 import sys
 
 import rucio.client
+from rucio.common.exception import RuleNotFound
 
 import clint
 
 RULE_STATE_OK = 'OK'
 RULE_STATE_REPLICATING = 'REPLICATING'
+RULE_STATE_GONE = 'GONE'  # Rucio no longer knows the rule: it expired and was removed
 
 # Escalation thresholds from the Study doc (Study section 3, "Escalation thresholds").
 BACKLOG_FACTOR_THRESHOLD = 2.0
@@ -123,6 +125,8 @@ def _rule_states(rucio_client, rule_ids):
     for rule_id in rule_ids:
         try:
             states[rule_id] = rucio_client.get_replication_rule(rule_id).get('state')
+        except RuleNotFound:
+            states[rule_id] = RULE_STATE_GONE
         except Exception as e:
             print(f'clint_monitor: could not query rule {rule_id}: {e}', file=sys.stderr)
             states[rule_id] = None
@@ -145,12 +149,15 @@ def build_scorecard(rucio_client, src, dst, mbps, window_seconds, now, heartbeat
     events = _read_ledger_events(src, dst, window_seconds, now)
     injected_events = [e for e in events if e.get('event') == 'injected']
 
-    rule_ids = sorted({e['rule_id'] for e in injected_events if e.get('rule_id') != 'dry-run'})
+    # A rule that clint.py saw OK needs no query: it may have expired and been removed since.
+    confirmed_ok = {e['rule_id'] for e in events if e.get('event') == 'rule_ok'}
+    rule_ids = sorted({e['rule_id'] for e in injected_events if e.get('rule_id') != 'dry-run'} - confirmed_ok)
     states = _rule_states(rucio_client, rule_ids)
 
     injected_bytes = 0
     completed_bytes = 0
     backlog_bytes = 0
+    expired_unconfirmed_bytes = 0
     stuck_rule_ids = []
     for e in injected_events:
         size = e.get('bytes', 0)
@@ -162,8 +169,11 @@ def build_scorecard(rucio_client, src, dst, mbps, window_seconds, now, heartbeat
             completed_bytes += size
             continue
         state = states.get(rule_id)
-        if state == RULE_STATE_OK:
+        if state == RULE_STATE_OK or rule_id in confirmed_ok:
             completed_bytes += size
+        elif state == RULE_STATE_GONE:
+            # Expired and removed before anybody saw it OK: neither backlog nor proven complete.
+            expired_unconfirmed_bytes += size
         else:
             backlog_bytes += size
             if state != RULE_STATE_REPLICATING:
@@ -188,6 +198,7 @@ def build_scorecard(rucio_client, src, dst, mbps, window_seconds, now, heartbeat
         'injected_bytes': injected_bytes,
         'completed_bytes': completed_bytes,
         'backlog_bytes': backlog_bytes,
+        'expired_unconfirmed_bytes': expired_unconfirmed_bytes,
         'stuck_rule_ids': stuck_rule_ids,
         'achieved_mbps': achieved_mbps,
         'dest_usage_fraction': _rse_usage_fraction(rucio_client, dst),
