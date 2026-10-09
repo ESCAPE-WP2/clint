@@ -5,6 +5,7 @@ Exposes `clint <command> [arguments] [options]`. Today that is:
   clint run [flags]         -- run the injection daemon (same as `python clint.py [flags]`)
   clint preflight [flags]   -- check a config against the real dataset pool and
                                 destination RSEs before starting a run
+  clint plot [folders]      -- draw the metrics of one or several runs (needs matplotlib)
 
 `python clint.py [flags]` keeps working unchanged for existing HTCondor
 submission scripts; this module is an additional entry point, not a
@@ -34,6 +35,14 @@ def _cmd_run(args):
     signal.signal(signal.SIGTERM, clint.signal_handler)
     clint.validate_run_args(args)
     clint.run(args)
+
+
+def _cmd_plot(args):
+    import clint_plot
+    argv = list(args.folders) + ['--out', args.out]
+    if args.label:
+        argv += ['--label'] + list(args.label)
+    return clint_plot.main(argv)
 
 
 def _rse_space(rucio_client, rse):
@@ -176,6 +185,12 @@ def _build_parser():
     preflight_parser.add_argument('--json', action='store_true',
                                    help='Print a single JSON document instead of a table')
     preflight_parser.set_defaults(func=_cmd_preflight)
+
+    plot_parser = sub.add_parser('plot', help='Draw plots of one or several runs from their ledgers (needs matplotlib)')
+    plot_parser.add_argument('folders', nargs='*', default=['.'], help='work folder of a run (default: the current folder)')
+    plot_parser.add_argument('--out', default='.', help='folder for the PNG files (default: the current folder)')
+    plot_parser.add_argument('--label', nargs='*', help='one name per folder (default: the folder name)')
+    plot_parser.set_defaults(func=_cmd_plot)
 
     return parser
 

@@ -86,6 +86,24 @@ python clint.py --help
 
 - Injection events are logged to `clint_injection.log` with dataset, source, destination, and user info for auditing.
 
+## Plots
+
+`clint_plot.py` draws the metrics of a run from the ledgers (`clint_ledger_*.jsonl`) in its work folder. It needs matplotlib
+(`pip install -r requirements-plot.txt`), but not rucio.
+
+```
+python cli.py plot                          # the run in the current folder: clint_run_<folder>.png
+python cli.py plot runA runB runC --out out # one figure per run, and clint_compare.png
+python clint_plot.py runA --label student-1 # same, without rucio installed
+```
+
+A run figure shows the volume wanted, injected and completed over time, the data in flight, the time from rule to `OK`, and
+the events per link (`skipped_bad`, `throttled`, ...). The comparison overlays the completed volume and the average rate of
+several runs, for example one per student in a data challenge.
+
+"Completed" means that CLINT saw the rule in state `OK`. CLINT looks once per cycle, so times have the resolution of a cycle,
+and the last rules of a run may be missing.
+
 ## Contributing
 
 Contributions are welcome! Please fork, create feature branches, and submit pull requests.  
