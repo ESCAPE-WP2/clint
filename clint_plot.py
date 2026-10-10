@@ -382,14 +382,36 @@ def _spread_wanted(cycles, t0, bin_s, n):
     return wanted
 
 
+def run_ends(cycles):
+    """{(participant, link): end of the injection} = time of the last cycle plus one cycle."""
+    by_link = {}
+    for c in cycles:
+        if c['_t']:
+            by_link.setdefault((c['participant'], c['dst']), []).append(c)
+    ends = {}
+    for key, link_cycles in by_link.items():
+        link_cycles.sort(key=lambda c: c['_t'])
+        gaps = [(b['_t'] - a['_t']).total_seconds() for a, b in zip(link_cycles, link_cycles[1:])]
+        last = link_cycles[-1]
+        interval = last['_interval'] or (statistics.median(gaps) if gaps else 0)
+        ends[key] = last['_t'] + datetime.timedelta(seconds=interval)
+    return ends
+
+
 def achievement(rules, cycles):
-    """{(participant, link): completed bytes / wanted bytes}. A link without wanted bytes is left out."""
+    """{(participant, link): completed bytes / wanted bytes}. A link without wanted bytes is left out.
+
+    Only rules that finished before the injection of their link ended count as completed: a rule that
+    finishes minutes later does not help the rate that the link had during the run (the report also
+    measures the rate per interval, not in the end).
+    """
     wanted, completed = {}, {}
+    ends = run_ends(cycles)
     for c in cycles:
         wanted[(c['participant'], c['dst'])] = wanted.get((c['participant'], c['dst']), 0) + c['wanted_bytes']
     for r in rules:
-        if r['_done']:
-            key = (r['participant'], r['dst'])
+        key = (r['participant'], r['dst'])
+        if r['_done'] and (key not in ends or r['_done'] <= ends[key]):
             completed[key] = completed.get(key, 0) + r['bytes']
     return {k: completed.get(k, 0) / w for k, w in wanted.items() if w > 0}
 
@@ -456,7 +478,7 @@ def plot_class(rules, cycles, path):
         ax_hm.set_xticklabels(links, fontsize=8)
         ax_hm.set_yticks([i + .5 for i in range(len(who))])
         ax_hm.set_yticklabels(who, fontsize=8)
-        ax_hm.set_title('Achievement: completed / wanted  (green ≥ .9, yellow ≥ .7, orange ≥ .5, red < .5)', fontsize=9)
+        ax_hm.set_title('Achievement: finished during the run / wanted\n(green ≥ .9, yellow ≥ .7, orange ≥ .5, red < .5)', fontsize=9)
     else:
         _no_data(ax_hm, 'no cycles in the files')
 
@@ -481,7 +503,8 @@ def plot_class(rules, cycles, path):
 
     total_done = sum(r['bytes'] for r in rules if r['_done']) / 1e9
     total_wanted = sum(c['wanted_bytes'] for c in cycles) / 1e9
-    fig.suptitle(f'CLINT data challenge: {len(who)} participants, completed {total_done:.1f} GB of {total_wanted:.1f} GB wanted')
+    fig.suptitle(f'CLINT data challenge: {len(who)} participant{"s" if len(who) != 1 else ""}, '
+                 f'{total_done:.1f} GB finished in the end, {total_wanted:.1f} GB wanted')
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)

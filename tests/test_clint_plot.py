@@ -228,3 +228,18 @@ def _run_in_tmpdir(fn):
             return fn(d)
         finally:
             os.chdir(old)
+
+
+class TestAchievementLag(unittest.TestCase):
+
+    def test_a_rule_that_finishes_after_the_run_does_not_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            import clint_export as ex
+            links = {('S', 'D'): [dict(e, _t=plot._ts(e['ts'])) for e in _events()]}
+            rules = ex.rule_rows(links, 'ann')
+            rules[0]['closed_at'] = _at(1000)   # the run ends at 240 + 120 = 360 s
+            ex.write_csv(os.path.join(d, 'clint_rules_ann.csv'), ex.RULE_FIELDS, rules)
+            ex.write_csv(os.path.join(d, 'clint_cycles_ann.csv'), ex.CYCLE_FIELDS, ex.cycle_rows(links, 'ann'))
+            loaded_rules, cycles = plot.load_csv_class(d)
+        # r1: ok_seen at 240 but closed_at at 1000: the closed time wins, so it is late
+        self.assertEqual(plot.achievement(loaded_rules, cycles)[('ann', 'D')], 0.0)
