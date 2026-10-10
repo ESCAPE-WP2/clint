@@ -97,6 +97,21 @@ python cli.py plot runA runB runC --out out # one figure per run, and clint_comp
 python clint_plot.py runA --label student-1 # same, without rucio installed
 ```
 
+Export and class plots, for a data challenge with many participants:
+
+```
+python cli.py export --participant ann         # clint_rules_ann.csv and clint_cycles_ann.csv (a few kB)
+python clint_plot.py --csv folder-with-all-csv --out plots     # clint_class.png
+```
+
+`export` writes one row per rule (`clint_rules_<name>.csv`) and one row per cycle (`clint_cycles_<name>.csv`). With Rucio
+access it adds the stage times of the transfer request of each rule: conveyor (rule to submitted), queue in FTS, the
+transfer itself, and the time until Rucio closes the request (poller and finisher). It also adds the FTS job id. Use
+`--no-rucio` to skip this. Rucio keeps one request record per file and destination, so a rule on a dataset that you
+used in an earlier run has empty stage times. The class figure shows the completed rate of all participants against the
+target, the achievement ratio (completed / wanted, with the colour bands of the WLCG/DOMA Data Challenge 2024 report),
+where the time goes, and the rules in flight.
+
 A run figure shows the volume wanted, injected and completed over time, the data in flight, the time from rule to `OK`, and
 the events per link (`skipped_bad`, `throttled`, ...). The comparison overlays the completed volume and the average rate of
 several runs, for example one per student in a data challenge.

@@ -453,7 +453,8 @@ def run_transfer_thread(link, storage_data, injection_interval, rule_lifetime, f
                 consecutive_failed_cycles = 0
 
         log_ledger_event(src, dst, 'cycle', wanted_bytes=injection_bytes, injected_bytes=injected_bytes,
-                          n_rules=len(selected_datasets), cycle_duration_s=round(time.time() - cycle_start_time, 3))
+                          n_rules=len(selected_datasets), cycle_duration_s=round(time.time() - cycle_start_time, 3),
+                          link_mbps=mbps, interval_s=injection_interval)
 
         # Checkpoint every cycle, not only on shutdown -- a hard kill between
         # checkpoints would otherwise lose re-injection state and re-inject

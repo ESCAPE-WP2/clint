@@ -6,6 +6,7 @@ Exposes `clint <command> [arguments] [options]`. Today that is:
   clint preflight [flags]   -- check a config against the real dataset pool and
                                 destination RSEs before starting a run
   clint plot [folders]      -- draw the metrics of one or several runs (needs matplotlib)
+  clint export --participant NAME  -- write the metrics of a run to two CSV files (to hand in)
 
 `python clint.py [flags]` keeps working unchanged for existing HTCondor
 submission scripts; this module is an additional entry point, not a
@@ -40,9 +41,19 @@ def _cmd_run(args):
 def _cmd_plot(args):
     import clint_plot
     argv = list(args.folders) + ['--out', args.out]
+    if args.csv:
+        argv += ['--csv', args.csv]
     if args.label:
         argv += ['--label'] + list(args.label)
     return clint_plot.main(argv)
+
+
+def _cmd_export(args):
+    import clint_export
+    argv = ['--participant', args.participant, '--folder', args.folder, '--out', args.out]
+    if args.no_rucio:
+        argv.append('--no-rucio')
+    return clint_export.main(argv)
 
 
 def _rse_space(rucio_client, rse):
@@ -190,7 +201,15 @@ def _build_parser():
     plot_parser.add_argument('folders', nargs='*', default=['.'], help='work folder of a run (default: the current folder)')
     plot_parser.add_argument('--out', default='.', help='folder for the PNG files (default: the current folder)')
     plot_parser.add_argument('--label', nargs='*', help='one name per folder (default: the folder name)')
+    plot_parser.add_argument('--csv', metavar='DIR', help='folder with the CSV files of many participants (clint_class.png)')
     plot_parser.set_defaults(func=_cmd_plot)
+
+    export_parser = sub.add_parser('export', help='Write the metrics of a run to two CSV files, to hand in')
+    export_parser.add_argument('--participant', required=True, help='your name or account: it labels your rows')
+    export_parser.add_argument('--folder', default='.', help='work folder of the run (default: the current folder)')
+    export_parser.add_argument('--out', default='.', help='folder for the CSV files (default: the current folder)')
+    export_parser.add_argument('--no-rucio', action='store_true', help='do not ask Rucio for the stage times')
+    export_parser.set_defaults(func=_cmd_export)
 
     return parser
 
