@@ -88,19 +88,26 @@ python clint.py --help
 
 ## Plots
 
-`clint_plot.py` draws the metrics of a run from the ledgers (`clint_ledger_*.jsonl`) in its work folder. It needs matplotlib
-(`pip install -r requirements-plot.txt`), but not rucio.
+`clint_plot.py` draws one figure per call, in the style of [mplhep](https://scikit-hep.org/mplhep) (without mplhep: the same
+layout in the plain style). It needs matplotlib and, for the HEP look, mplhep (`pip install -r requirements-plot.txt`).
+It does not need rucio.
 
 ```
-python cli.py plot                          # the run in the current folder: clint_run_<folder>.png
-python cli.py plot runA runB runC --out out # one figure per run, and clint_compare.png
-python clint_plot.py runA --label student-1 # same, without rucio installed
+python cli.py plot                              # the run in the current folder: clint_run_<folder>.png
+python cli.py plot runA runB runC --out out     # many runs in one figure: clint_class.png
+python clint_plot.py runA --label student-1     # the same, without rucio installed
+python cli.py plot runA runB --align            # runs made at different times: start them together
 ```
 
-Export and class plots, for a data challenge with many participants:
+The figure of one run has two panels: the **completed rate against the target** over time, and **where the time goes**.
+With more than one run there is a third panel, the **achievement ratio** (finished during the run / wanted) of each
+participant and link, with the colour bands of the WLCG/DOMA Data Challenge 2024 report (green ≥ 0.9, yellow ≥ 0.7,
+orange ≥ 0.5, red < 0.5). More than six participants are drawn as one block in the rate panel.
+
+For a data challenge with many participants, each one exports two small CSV files and the instructor draws the class figure:
 
 ```
-python cli.py export --participant ann         # clint_rules_ann.csv and clint_cycles_ann.csv (a few kB)
+python cli.py export --participant ann                         # clint_rules_ann.csv and clint_cycles_ann.csv (a few kB)
 python clint_plot.py --csv folder-with-all-csv --out plots     # clint_class.png
 ```
 
@@ -108,16 +115,8 @@ python clint_plot.py --csv folder-with-all-csv --out plots     # clint_class.png
 access it adds the stage times of the transfer request of each rule: conveyor (rule to submitted), queue in FTS, the
 transfer itself, and the time until Rucio closes the request (poller and finisher). It also adds the FTS job id. Use
 `--no-rucio` to skip this. Rucio keeps one request record per file and destination, so a rule on a dataset that you
-used in an earlier run has empty stage times. The class figure shows the completed rate of all participants against the
-target, the achievement ratio (completed / wanted, with the colour bands of the WLCG/DOMA Data Challenge 2024 report),
-where the time goes, and the rules in flight.
-
-A run figure shows the volume wanted, injected and completed over time, the data in flight, the time from rule to `OK`, and
-the events per link (`skipped_bad`, `throttled`, ...). The comparison overlays the completed volume and the average rate of
-several runs, for example one per student in a data challenge.
-
-"Completed" means that CLINT saw the rule in state `OK`. CLINT looks once per cycle, so times have the resolution of a cycle,
-and the last rules of a run may be missing.
+used in an earlier run has empty stage times. Without stage times (ledgers only), the last panel shows the time until CLINT
+saw the rule in state `OK`: CLINT looks once per cycle, so this is an upper bound with the resolution of a cycle.
 
 ## Contributing
 

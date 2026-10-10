@@ -1,24 +1,22 @@
-"""Plots for CLINT runs.
+"""Plots for CLINT runs, in the style of mplhep (https://scikit-hep.org/mplhep).
 
-Reads the per-link ledgers (clint_ledger_<src>_to_<dst>.jsonl) that a run leaves in its
-work folder and draws:
+One figure per call:
 
-  clint_run_<label>.png   one run: volume injected / completed / wanted over time, data in
-                          flight, time from rule to OK, and what happened per link
-  clint_compare.png       several runs (for example one per student) on the same axes
-  clint_class.png         from the CSV files of clint_export.py of many participants: throughput of the
-                          class against the target, achievement ratio per participant and link,
-                          where the time goes, and the rules in flight
+  one run     clint_run_<label>.png   completed rate against the target, and where the time goes
+  many runs   clint_class.png         the same, plus the achievement ratio of each participant and link
 
-The ledger is the only input. "Completed" means that CLINT saw the rule in state OK: it
-checks once per cycle, so the time from rule to OK is an upper bound with the resolution
-of one cycle, and the last rules of a run may be missing.
+Input is either the work folders of the runs (the ledgers clint_ledger_<src>_to_<dst>.jsonl), or a folder with
+the CSV files of clint_export.py of many participants (--csv). The CSV files have the stage times from Rucio:
+conveyor, queue in FTS, transfer, and the time until Rucio closes the request. Ledgers alone only know when
+CLINT saw the rule in state OK, so the last panel then shows that time (an upper bound, with the resolution of
+one cycle).
 
-This module needs matplotlib (pip install matplotlib) but not rucio, so it also runs on a laptop.
+Needs matplotlib. With mplhep (pip install mplhep) the figures get the HEP look; without it they get the same
+layout in the plain style. rucio is not needed, so it also runs on a laptop.
 
 Usage:
-    python clint_plot.py [RUN_DIR ...] [--out OUT_DIR] [--label NAME ...]
-    python clint_plot.py --csv CSV_DIR [--out OUT_DIR]
+    python clint_plot.py [RUN_DIR ...] [--out OUT_DIR] [--label NAME ...] [--align]
+    python clint_plot.py --csv CSV_DIR [--out OUT_DIR] [--align]
 """
 
 import argparse
@@ -32,12 +30,17 @@ import statistics
 import sys
 
 LEDGER_RE = re.compile(r'clint_ledger_(?P<src>.+?)_to_(?P<dst>.+)\.jsonl$')
-MB = 1e6
 MBPS_BYTES = 125000  # bytes per second in one Mbps
 
-# Events counted in the per-link summary, in the order of the bars.
-SUMMARY_EVENTS = ('rule_ok', 'rule_gone', 'skipped_bad', 'throttled', 'blocked_no_space', 'injection_failed')
+# Colour bands of the WLCG/DOMA Data Challenge 2024 report for observed / expected.
+RATIO_BANDS = ((0.9, 'green'), (0.7, 'gold'), (0.5, 'orange'), (0.0, 'red'))
+STAGES = (('conveyor_s', 'rule waits for the submitter'), ('fts_queue_s', 'queue in FTS'),
+          ('transfer_s', 'transfer'), ('after_transfer_s', 'Rucio notices and closes it'))
+SEEN = ('seen_latency_s', 'until CLINT saw it OK')  # used when there are no stage times
+MAX_STACKED = 6  # more participants than this are drawn as one block in the rate panel
 
+
+# --- Reading ------------------------------------------------------------------------------------------------
 
 def _ts(text):
     return datetime.datetime.fromisoformat(text)
@@ -70,234 +73,6 @@ def load_run(folder):
     return links
 
 
-def run_start(links):
-    """Time of the first event of any link, or None."""
-    times = [e['_t'] for events in links.values() for e in events]
-    return min(times) if times else None
-
-
-def _cumulative(points, t0):
-    """[(t, value)] -> ([minutes since t0], [running sum]) with a point at t0."""
-    xs, ys, total = [0.0], [0.0], 0
-    for t, value in sorted(points):
-        total += value
-        xs.append((t - t0).total_seconds() / 60)
-        ys.append(total)
-    return xs, ys
-
-
-def link_series(events, t0):
-    """Curves of one link, in minutes since t0 and bytes.
-
-    injected   running sum of the bytes of the rules that CLINT made
-    completed  running sum of the bytes of the rules that CLINT saw OK
-    wanted     running sum of the bytes that the rate asked for, one step per cycle
-    in_flight  injected - completed - gone, as (minutes, bytes)
-    """
-    injected = [(e['_t'], e.get('bytes', 0)) for e in events if e['event'] == 'injected' and e.get('rule_id') != 'dry-run']
-    completed = [(e['_t'], e.get('bytes', 0)) for e in events if e['event'] == 'rule_ok']
-    gone = [(e['_t'], e.get('bytes', 0)) for e in events if e['event'] == 'rule_gone']
-    wanted = [(e['_t'], e.get('wanted_bytes', 0)) for e in events if e['event'] == 'cycle']
-
-    flow = [(t, b) for t, b in injected] + [(t, -b) for t, b in completed] + [(t, -b) for t, b in gone]
-    return {
-        'injected': _cumulative(injected, t0),
-        'completed': _cumulative(completed, t0),
-        'wanted': _cumulative(wanted, t0),
-        'in_flight': _cumulative(flow, t0),
-    }
-
-
-def latencies(events):
-    """Seconds from the rule to the first time CLINT saw it OK, for each rule that has both."""
-    made = {e['rule_id']: e['_t'] for e in events if e['event'] == 'injected' and e.get('rule_id') != 'dry-run'}
-    return [(e['_t'] - made[e['rule_id']]).total_seconds()
-            for e in events if e['event'] == 'rule_ok' and e.get('rule_id') in made]
-
-
-def event_counts(events):
-    counts = {name: 0 for name in SUMMARY_EVENTS}
-    for e in events:
-        if e['event'] in counts:
-            counts[e['event']] += 1
-    return counts
-
-
-def cycle_seconds(events):
-    """Median time between two cycles of a link, or 0 if there are fewer than two."""
-    times = [e['_t'] for e in events if e['event'] == 'cycle']
-    gaps = [(b - a).total_seconds() for a, b in zip(times, times[1:])]
-    return statistics.median(gaps) if gaps else 0.0
-
-
-def run_summary(links):
-    """Average rates of a run, summed over its links.
-
-    Active time goes from the first cycle to the last cycle plus one cycle. All of it is
-    counted, so a pause between two phases in the same folder lowers the averages.
-    """
-    achieved = wanted = 0.0
-    for events in links.values():
-        cycles = [e['_t'] for e in events if e['event'] == 'cycle']
-        if not cycles:
-            continue
-        duration = (max(cycles) - min(cycles)).total_seconds() + cycle_seconds(events)
-        if duration <= 0:
-            continue
-        achieved += sum(e.get('bytes', 0) for e in events if e['event'] == 'rule_ok') / duration / MBPS_BYTES
-        wanted += sum(e.get('wanted_bytes', 0) for e in events if e['event'] == 'cycle') / duration / MBPS_BYTES
-    return {'achieved_mbps': achieved, 'wanted_mbps': wanted}
-
-
-def _pyplot():
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-    except ImportError:
-        raise SystemExit('Error: matplotlib is needed for the plots: pip install matplotlib')
-    return plt
-
-
-def _link_names(links):
-    """Names for the legends. When all links start at one source, only the destination is shown."""
-    sources = {src for src, _ in links}
-    if len(sources) == 1:
-        return {link: link[1] for link in links}, f'from {next(iter(sources))}'
-    return {link: f'{link[0]}→{link[1]}' for link in links}, ''
-
-
-def _palette(plt, n):
-    """n distinguishable colours: the default cycle up to 10, then tab20, then a colour map."""
-    if n <= 10:
-        return plt.rcParams['axes.prop_cycle'].by_key()['color']
-    if n <= 20:
-        return list(plt.get_cmap('tab20').colors)
-    return [plt.get_cmap('viridis')(i / (n - 1)) for i in range(n)]
-
-
-def _no_data(ax, text):
-    """Replace the content of an axes by a short message, without ticks."""
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.text(.5, .5, text, ha='center', va='center', transform=ax.transAxes, color='grey')
-
-
-def plot_run(links, label, path):
-    """One figure for one run."""
-    plt = _pyplot()
-    t0 = run_start(links)
-    if t0 is None:
-        raise ValueError(f'{label}: no ledger events to plot')
-    fig, ((ax_vol, ax_fly), (ax_lat, ax_cnt)) = plt.subplots(2, 2, figsize=(12, 8))
-    colors = _palette(plt, len(links))
-    names, origin = _link_names(links)
-
-    all_latencies, lifetime = [], None
-    for i, (link, events) in enumerate(sorted(links.items())):
-        color, name = colors[i % len(colors)], names[link]
-        width = max(2.6 - 1.2 * i, 1.2)  # links with identical data stay visible
-        s = link_series(events, t0)
-        ax_vol.step(s['wanted'][0], [b / 1e9 for b in s['wanted'][1]], where='post', ls='--', color=color, alpha=.6,
-                    label=f'{name} wanted')
-        ax_vol.step(s['injected'][0], [b / 1e9 for b in s['injected'][1]], where='post', ls=':', color=color,
-                    label=f'{name} injected')
-        ax_vol.step(s['completed'][0], [b / 1e9 for b in s['completed'][1]], where='post', color=color, lw=width,
-                    label=f'{name} completed')
-        ax_fly.step(s['in_flight'][0], [b / MB for b in s['in_flight'][1]], where='post', color=color, lw=width,
-                    label=name)
-        all_latencies += latencies(events)
-        for e in events:
-            if e['event'] == 'injected' and e.get('lifetime'):
-                lifetime = e['lifetime']
-
-    ax_vol.set(title=f'Volume over time {origin}'.strip(), xlabel='minutes since the start', ylabel='GB')
-    ax_vol.legend(fontsize=7)
-    ax_fly.set(title='Data in flight (rules not yet seen OK)', xlabel='minutes since the start', ylabel='MB')
-    if any(max(link_series(ev, t0)['in_flight'][1]) > 0 for ev in links.values()):
-        ax_fly.legend(fontsize=8)
-    else:
-        _no_data(ax_fly, 'no rule in flight')
-
-    ax_lat.set(title='Time from rule to OK (upper bound, one cycle resolution)')
-    if all_latencies:
-        ax_lat.hist([x / 60 for x in all_latencies], bins=12, color=colors[0])
-        ax_lat.set(xlabel='minutes', ylabel='rules')
-        if lifetime:
-            ax_lat.axvline(lifetime / 60, color='red', ls='--', label=f'rule lifetime ({lifetime // 60} min)')
-            ax_lat.legend(fontsize=8)
-    else:
-        _no_data(ax_lat, 'no rule was seen OK')
-
-    kinds = list(SUMMARY_EVENTS)
-    width = 0.8 / max(len(links), 1)
-    all_counts = {link: event_counts(events) for link, events in links.items()}
-    ax_cnt.set(title='What happened')
-    if any(any(c.values()) for c in all_counts.values()):
-        for i, (link, counts) in enumerate(sorted(all_counts.items())):
-            ax_cnt.bar([k + i * width for k in range(len(kinds))], [counts[n] for n in kinds], width,
-                       color=colors[i % len(colors)], label=names[link])
-        ax_cnt.set_xticks([k + width * (len(links) - 1) / 2 for k in range(len(kinds))])
-        ax_cnt.set_xticklabels(kinds, rotation=25, ha='right', fontsize=8)
-        ax_cnt.set_ylabel('events')
-        ax_cnt.legend(fontsize=8)
-    else:
-        _no_data(ax_cnt, 'no events')
-
-    summary = run_summary(links)
-    fig.suptitle(f'CLINT run {label}: wanted {summary["wanted_mbps"]:.1f} Mbps, '
-                 f'completed {summary["achieved_mbps"]:.1f} Mbps on average')
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
-def plot_compare(runs, path):
-    """One figure for several runs: {label: links}."""
-    plt = _pyplot()
-    fig, (ax_cum, ax_bar) = plt.subplots(1, 2, figsize=(12, 5))
-    labels = sorted(runs)
-    colors = _palette(plt, len(labels))
-    for i, label in enumerate(labels):
-        links = runs[label]
-        t0 = run_start(links)
-        if t0 is None:
-            continue
-        points = [(e['_t'], e.get('bytes', 0)) for events in links.values() for e in events if e['event'] == 'rule_ok']
-        xs, ys = _cumulative(points, t0)
-        ax_cum.step(xs, [y / 1e9 for y in ys], where='post', lw=1.4, color=colors[i % len(colors)], label=label)
-    ax_cum.set(title='Completed volume, all links of a run', xlabel='minutes since the start of the run', ylabel='GB')
-    ax_cum.legend(fontsize=7 if len(labels) > 8 else 8, ncol=2 if len(labels) > 8 else 1, loc='upper left')
-
-    summaries = [run_summary(runs[label]) for label in labels]
-    xs = range(len(labels))
-    ax_bar.bar([x - .2 for x in xs], [s['wanted_mbps'] for s in summaries], .4, color='lightgrey', label='wanted')
-    ax_bar.bar([x + .2 for x in xs], [s['achieved_mbps'] for s in summaries], .4, label='completed')
-    ax_bar.set_xticks(list(xs))
-    ax_bar.set_xticklabels(labels, rotation=25, ha='right', fontsize=8)
-    ax_bar.set(title='Average rate', ylabel='Mbps')
-    ax_bar.set_ylim(0, max([s['wanted_mbps'] for s in summaries] + [s['achieved_mbps'] for s in summaries] + [1]) * 1.25)
-    ax_bar.legend(fontsize=8, loc='upper right', ncol=2)
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
-# --- Class plots from the CSV files of clint_export.py ---------------------------------------------------
-
-# Colour bands of the DC24 report for observed / expected: green >= 0.9, yellow >= 0.7, orange >= 0.5, red below.
-RATIO_BANDS = ((0.9, 'green'), (0.7, 'gold'), (0.5, 'orange'), (0.0, 'red'))
-STAGES = (('conveyor_s', 'rule waits for the submitter'), ('fts_queue_s', 'queue in FTS'),
-          ('transfer_s', 'transfer'), ('after_transfer_s', 'poller and finisher'))
-
-
-def ratio_color(ratio):
-    for limit, color in RATIO_BANDS:
-        if ratio >= limit:
-            return color
-    return 'red'
-
-
 def _num(text):
     try:
         return float(text)
@@ -309,13 +84,8 @@ def _time(text):
     return datetime.datetime.fromisoformat(text) if text else None
 
 
-def load_csv_class(folder):
-    """(rules, cycles) from every clint_rules_*.csv and clint_cycles_*.csv in `folder`."""
-    rules, cycles = [], []
-    for pattern, target in (('clint_rules_*.csv', rules), ('clint_cycles_*.csv', cycles)):
-        for path in sorted(glob.glob(os.path.join(folder, pattern))):
-            with open(path, newline='') as f:
-                target.extend(csv.DictReader(f))
+def _typed(rules, cycles):
+    """Add parsed values (names with a leading underscore) to the rows of the export, in place."""
     for r in rules:
         r['bytes'] = _num(r.get('bytes')) or 0
         r['_inj'] = _time(r.get('injected_at'))
@@ -329,10 +99,68 @@ def load_csv_class(folder):
     return rules, cycles
 
 
-def class_series(rules, cycles, bin_s=120):
-    """Per time bin: completed bytes by participant, and wanted bytes of the class.
+def load_csv_class(folder):
+    """(rules, cycles) from every clint_rules_*.csv and clint_cycles_*.csv in `folder`."""
+    rules, cycles = [], []
+    for pattern, target in (('clint_rules_*.csv', rules), ('clint_cycles_*.csv', cycles)):
+        for path in sorted(glob.glob(os.path.join(folder, pattern))):
+            with open(path, newline='') as f:
+                target.extend(csv.DictReader(f))
+    return _typed(rules, cycles)
 
-    Returns (t0, edges_in_minutes, {participant: [bytes per bin]}, [wanted bytes per bin]).
+
+def align_starts(rules, cycles):
+    """Shift the times of each participant so that all start together, in place. For runs that were made at
+    different times; a class that started together does not need it."""
+    first = {}
+    for r in rules:
+        if r['_inj']:
+            first[r['participant']] = min(first.get(r['participant'], r['_inj']), r['_inj'])
+    for c in cycles:
+        if c['_t']:
+            first[c['participant']] = min(first.get(c['participant'], c['_t']), c['_t'])
+    if not first:
+        return rules, cycles
+    start = min(first.values())
+    for r in rules:
+        shift = first.get(r['participant'], start) - start
+        for key in ('_inj', '_done'):
+            if r[key]:
+                r[key] -= shift
+    for c in cycles:
+        if c['_t']:
+            c['_t'] -= first.get(c['participant'], start) - start
+    return rules, cycles
+
+
+def load_run_from_events(events, link=('S', 'D')):
+    """{link: events} for events that are already in memory (dicts of a ledger, with 'ts'). For tests and scripts."""
+    return {link: [dict(e, _t=_ts(e['ts'])) for e in events]}
+
+
+def rows_from_ledgers(runs):
+    """(rules, cycles) from {label: links}: the same rows as the CSV export, without stage times."""
+    import clint_export  # not at the top: clint_export imports this module
+    rules, cycles = [], []
+    for label, links in runs.items():
+        rules += clint_export.rule_rows(links, label)
+        cycles += clint_export.cycle_rows(links, label)
+    return _typed(rules, cycles)
+
+
+# --- Numbers behind the figures -------------------------------------------------------------------------------
+
+def ratio_color(ratio):
+    for limit, color in RATIO_BANDS:
+        if ratio >= limit:
+            return color
+    return 'red'
+
+
+def class_series(rules, cycles, bin_s=120):
+    """Per time bin: completed bytes by participant, and wanted bytes of everybody.
+
+    Returns (t0, edges in minutes, {participant: [bytes per bin]}, [wanted bytes per bin]).
     """
     stamps = [r['_inj'] for r in rules if r['_inj']] + [c['_t'] for c in cycles if c['_t']]
     if not stamps:
@@ -344,14 +172,13 @@ def class_series(rules, cycles, bin_s=120):
     for r in rules:
         if r['_done']:
             done.setdefault(r['participant'], [0.0] * n)[int((r['_done'] - t0).total_seconds() // bin_s)] += r['bytes']
-    wanted = _spread_wanted(cycles, t0, bin_s, n)
-    return t0, [i * bin_s / 60 for i in range(n + 1)], done, wanted
+    return t0, [i * bin_s / 60 for i in range(n + 1)], done, _spread_wanted(cycles, t0, bin_s, n)
 
 
 def _spread_wanted(cycles, t0, bin_s, n):
-    """Wanted bytes per bin. The bytes of a cycle are spread evenly over the length of the cycle, so that
-    cycles of different length (the two phases) give a steady target rate. Needs link_mbps and interval_s
-    in the cycle rows for an exact result; older files use an estimate."""
+    """Wanted bytes per bin, as a steady rate. A cycle asks for link_mbps for the time that it ran: its
+    interval, or less if the run stopped or the next phase began. Needs link_mbps and interval_s in the
+    cycle rows; older files use the larger gap next to the cycle as an estimate."""
     wanted = [0.0] * n
     by_link = {}
     for c in cycles:
@@ -362,14 +189,10 @@ def _spread_wanted(cycles, t0, bin_s, n):
         gaps = [(b['_t'] - a['_t']).total_seconds() for a, b in zip(link_cycles, link_cycles[1:])]
         for i, c in enumerate(link_cycles):
             start = (c['_t'] - t0).total_seconds()
-            # The interval of a cycle is the larger gap next to it: the last cycle of a run that stops early
-            # is followed by a shorter gap, and the first cycle of the next run is preceded by one.
             if c['_mbps'] is not None and c['_interval']:
-                # exact: the link target, for as long as the cycle ran (a run that stops early cuts its last cycle)
                 period = min(c['_interval'], gaps[i]) if i < len(gaps) else c['_interval']
-                rate = c['_mbps'] * 125000
+                rate = c['_mbps'] * MBPS_BYTES
             else:
-                # older ledgers: the larger gap next to the cycle
                 neighbours = gaps[max(i - 1, 0):i + 1]
                 period = max(neighbours) if neighbours else bin_s
                 rate = c['wanted_bytes'] / period if period > 0 else 0
@@ -402,8 +225,8 @@ def achievement(rules, cycles):
     """{(participant, link): completed bytes / wanted bytes}. A link without wanted bytes is left out.
 
     Only rules that finished before the injection of their link ended count as completed: a rule that
-    finishes minutes later does not help the rate that the link had during the run (the report also
-    measures the rate per interval, not in the end).
+    finishes minutes later does not help the rate that the link had during the run. The report also
+    measures the rate per interval, not in the end.
     """
     wanted, completed = {}, {}
     ends = run_ends(cycles)
@@ -417,116 +240,194 @@ def achievement(rules, cycles):
 
 
 def stage_medians(rules):
-    """{participant: {stage column: median seconds}} for participants that have stage times."""
+    """{participant: {column: median seconds}}. Stage times if there are any, else the time until CLINT saw OK."""
     out = {}
     for who in sorted({r['participant'] for r in rules}):
+        mine = [r for r in rules if r['participant'] == who]
         values = {}
         for column, _ in STAGES:
-            data = [_num(r.get(column)) for r in rules if r['participant'] == who and _num(r.get(column)) is not None]
+            data = [_num(r.get(column)) for r in mine if _num(r.get(column)) is not None]
             if data:
                 values[column] = statistics.median(data)
+        if not values:
+            data = [_num(r.get(SEEN[0])) for r in mine if _num(r.get(SEEN[0])) is not None]
+            if data:
+                values[SEEN[0]] = statistics.median(data)
         if values:
             out[who] = values
     return out
 
 
-def in_flight(rules, t0):
-    """([minutes], [rules in flight]) for the whole class. A rule without a known end ends at its expiry."""
-    points = []
-    for r in rules:
-        if not r['_inj']:
-            continue
-        end = r['_done'] or (r['_inj'] + datetime.timedelta(seconds=_num(r.get('lifetime_s')) or 0))
-        points += [(r['_inj'], 1), (end, -1)]
-    return _cumulative(points, t0)
+# --- Drawing --------------------------------------------------------------------------------------------------
+
+def _setup():
+    """(pyplot, mplhep or None). The HEP style is applied when mplhep is there."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        raise SystemExit('Error: matplotlib is needed for the plots: pip install matplotlib mplhep')
+    try:
+        import mplhep as hep
+        hep.style.use('CMS')
+    except ImportError:
+        hep = None
+        plt.rcParams.update({'xtick.direction': 'in', 'ytick.direction': 'in', 'xtick.top': True, 'ytick.right': True})
+    plt.rcParams.update({'font.size': 14, 'axes.labelsize': 15, 'legend.fontsize': 11, 'figure.dpi': 100})
+    return plt, hep
 
 
-def plot_class(rules, cycles, path):
-    """One figure for the whole class."""
-    plt = _pyplot()
+def _palette(plt, n):
+    """n distinguishable colours: the default cycle up to 10, then tab20, then a colour map."""
+    if n <= 10:
+        return plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if n <= 20:
+        return list(plt.get_cmap('tab20').colors)
+    return [plt.get_cmap('viridis')(i / (n - 1)) for i in range(n)]
+
+
+def _label(hep, ax, text):
+    if hep is not None:
+        try:
+            hep.label.exp_text(exp='CLINT', text=text, loc=0, ax=ax)
+            return
+        except Exception:  # the label is decoration: an older mplhep may not have it
+            pass
+    ax.set_title(f'CLINT {text}', loc='left', fontsize=13)
+
+
+def _no_data(ax, text):
+    ax.text(.5, .5, text, ha='center', va='center', transform=ax.transAxes, color='grey')
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def _draw_rate(plt, hep, ax, edges, done, wanted, who, bin_s, text):
+    to_mbps = 8 / 1e6 / bin_s
+    n = len(edges) - 1
+    per_person = [[b * to_mbps for b in done.get(p, [0.0] * n)] for p in who]
+    if len(who) > MAX_STACKED:
+        per_person, names = [[sum(col) for col in zip(*per_person)]], ['completed (all)']
+    else:
+        names = [f'{p} completed' for p in who] if len(who) > 1 else ['completed']
+    colors = _palette(plt, len(per_person))
+    target = [b * to_mbps for b in wanted]
+    if hep is not None:
+        hep.histplot(per_person, bins=edges, stack=True, histtype='fill', label=names, color=colors[:len(per_person)], ax=ax)
+        hep.histplot(target, bins=edges, histtype='step', color='black', linestyle='--', linewidth=2, label='target', ax=ax)
+    else:
+        bottom = [0.0] * n
+        for series, name, color in zip(per_person, names, colors):
+            top = [b + s for b, s in zip(bottom, series)]
+            ax.stairs(top, edges, baseline=bottom, fill=True, label=name, color=color)
+            bottom = top
+        ax.stairs(target, edges, color='black', linestyle='--', linewidth=2, label='target')
+    ax.set_xlabel('time since the start [min]')
+    ax.set_ylabel(f'completed rate [Mbps], {bin_s / 60:.0f}-min bins')
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.45)
+    ax.legend(loc='upper right', ncol=2 if len(names) > 3 else 1, frameon=False)
+    _label(hep, ax, text)
+
+
+def _draw_ratio(plt, ax, rules, cycles, who):
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    ratios = achievement(rules, cycles)
+    links = sorted({k[1] for k in ratios})
+    if not ratios:
+        _no_data(ax, 'no cycles in the files')
+        return
+    grid = [[ratios.get((p, link), float('nan')) for link in links] for p in who]
+    cmap = ListedColormap(['red', 'orange', 'gold', 'green'])
+    top = max(1.2, max(v for row in grid for v in row if v == v))
+    mesh = ax.pcolormesh(grid, cmap=cmap, norm=BoundaryNorm([0, .5, .7, .9, top], cmap.N), edgecolors='white', linewidth=2)
+    for i, row in enumerate(grid):
+        for j, value in enumerate(row):
+            if value == value:
+                ax.text(j + .5, i + .5, f'{value:.2f}', ha='center', va='center', fontsize=12)
+    ax.set_xticks([j + .5 for j in range(len(links))])
+    ax.set_xticklabels(links, fontsize=12)
+    ax.set_yticks([i + .5 for i in range(len(who))])
+    ax.set_yticklabels(who, fontsize=11)
+    ax.invert_yaxis()
+    ax.tick_params(which='both', length=0)
+    ax.set_title('finished during the run / wanted', fontsize=13)
+    cbar = ax.figure.colorbar(mesh, ax=ax, ticks=[.25, .6, .8, (.9 + top) / 2], fraction=.06, pad=.03)
+    cbar.ax.set_yticklabels(['< 0.5', '0.5 - 0.7', '0.7 - 0.9', '≥ 0.9'], fontsize=10)
+    cbar.ax.tick_params(length=0)
+
+
+def _draw_stages(plt, ax, rules, who):
+    medians = stage_medians(rules)
+    if not medians:
+        _no_data(ax, 'no rule was seen OK')
+        return
+    names = [p for p in who if p in medians]
+    stages = [s for s in STAGES if any(s[0] in medians[n] for n in names)] or [SEEN]
+    colors = plt.get_cmap('Set2')
+    left = [0.0] * len(names)
+    for k, (column, label) in enumerate(stages):
+        widths = [medians[n].get(column, 0) for n in names]
+        ax.barh(range(len(names)), widths, left=left, label=label, color=colors(k), height=.7)
+        left = [a + b for a, b in zip(left, widths)]
+    ax.set_ylim(max(len(names), 4) - .5, -.5)  # at least four rows, so that one bar does not fill the panel
+    ax.set_xlabel('median time per rule [s]')
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names, fontsize=11)
+    ax.legend(loc='lower right', frameon=False, fontsize=10)
+
+
+def plot_summary(rules, cycles, path, label=''):
+    """One figure: the rate panel and the stage panel, plus the achievement grid for more than one participant."""
+    plt, hep = _setup()
     t0, edges, done, wanted = class_series(rules, cycles)
     if t0 is None:
         raise ValueError('no rows to plot')
-    who = sorted({r['participant'] for r in rules})
-    colors = _palette(plt, len(who))
-    fig, ((ax_thr, ax_hm), (ax_stage, ax_fly)) = plt.subplots(2, 2, figsize=(13, 9))
+    who = sorted({r['participant'] for r in rules} | {c['participant'] for c in cycles})
     bin_s = (edges[1] - edges[0]) * 60 if len(edges) > 1 else 120
-    to_mbps = 8 / 1e6 / bin_s
 
-    mids = [(edges[i] + edges[i + 1]) / 2 for i in range(len(edges) - 1)]
-    series = [[b * to_mbps for b in done.get(p, [0.0] * len(mids))] for p in who]
-    if any(any(s) for s in series):
-        ax_thr.stackplot(mids, series, labels=who, colors=colors[:len(who)], step='mid')
-    ax_thr.step(edges[:-1], [b * to_mbps for b in wanted], where='post', color='black', ls='--', lw=1.6, label='target')
-    ax_thr.set(title=f'Completed rate of the class ({bin_s / 60:.0f}-minute bins)', xlabel='minutes since the start',
-               ylabel='Mbps')
-    ax_thr.legend(fontsize=6, ncol=2 if len(who) > 8 else 1, loc='upper left')
-
-    ratios = achievement(rules, cycles)
-    links = sorted({k[1] for k in ratios})
-    if ratios:
-        for i, p in enumerate(who):
-            for j, link in enumerate(links):
-                value = ratios.get((p, link))
-                if value is None:
-                    continue
-                ax_hm.add_patch(plt.Rectangle((j, i), 1, 1, color=ratio_color(value)))
-                ax_hm.text(j + .5, i + .5, f'{value:.2f}', ha='center', va='center', fontsize=8)
-        ax_hm.set_xlim(0, len(links))
-        ax_hm.set_ylim(len(who), 0)
-        ax_hm.set_xticks([j + .5 for j in range(len(links))])
-        ax_hm.set_xticklabels(links, fontsize=8)
-        ax_hm.set_yticks([i + .5 for i in range(len(who))])
-        ax_hm.set_yticklabels(who, fontsize=8)
-        ax_hm.set_title('Achievement: finished during the run / wanted\n(green ≥ .9, yellow ≥ .7, orange ≥ .5, red < .5)', fontsize=9)
+    if len(who) > 1:
+        fig = plt.figure(figsize=(15, 10.5))
+        grid = fig.add_gridspec(2, 2, height_ratios=[1.1, 1], width_ratios=[1, 1])
+        ax_rate = fig.add_subplot(grid[0, :])
+        ax_ratio = fig.add_subplot(grid[1, 0])
+        ax_stage = fig.add_subplot(grid[1, 1])
+        _draw_ratio(plt, ax_ratio, rules, cycles, who)
+        text = f'mini data challenge, {len(who)} participants'
     else:
-        _no_data(ax_hm, 'no cycles in the files')
-
-    medians = stage_medians(rules)
-    if medians:
-        left = [0.0] * len(medians)
-        names = list(medians)
-        for k, (column, label) in enumerate(STAGES):
-            widths = [medians[n].get(column, 0) for n in names]
-            ax_stage.barh(names, widths, left=left, label=label, color=plt.get_cmap('Set2')(k))
-            left = [a + b for a, b in zip(left, widths)]
-        ax_stage.invert_yaxis()
-        ax_stage.tick_params(axis='y', labelsize=8)
-        ax_stage.set(title='Where the time goes (median per rule)', xlabel='seconds')
-        ax_stage.legend(fontsize=7, loc='lower right')
-    else:
-        _no_data(ax_stage, 'no stage times: run clint_export.py with Rucio access')
-
-    xs, ys = in_flight(rules, t0)
-    ax_fly.step(xs, ys, where='post', color='tab:blue')
-    ax_fly.set(title='Rules in flight, whole class', xlabel='minutes since the start', ylabel='rules')
-
-    total_done = sum(r['bytes'] for r in rules if r['_done']) / 1e9
-    total_wanted = sum(c['wanted_bytes'] for c in cycles) / 1e9
-    fig.suptitle(f'CLINT data challenge: {len(who)} participant{"s" if len(who) != 1 else ""}, '
-                 f'{total_done:.1f} GB finished in the end, {total_wanted:.1f} GB wanted')
+        fig, (ax_rate, ax_stage) = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={'width_ratios': [1.6, 1]})
+        text = f'mini data challenge, {label or who[0]}'
+    _draw_rate(plt, hep, ax_rate, edges, done, wanted, who, bin_s, text)
+    _draw_stages(plt, ax_stage, rules, who)
     fig.tight_layout()
-    fig.savefig(path, dpi=120)
+    fig.savefig(path, dpi=110)
     plt.close(fig)
 
+
+# --- Command line -----------------------------------------------------------------------------------------------
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('folders', nargs='*', default=['.'], help='work folder of a run (default: the current folder)')
-    ap.add_argument('--out', default='.', help='folder for the PNG files (default: the current folder)')
+    ap.add_argument('--out', default='.', help='folder for the PNG file (default: the current folder)')
     ap.add_argument('--label', nargs='*', help='one name per folder (default: the folder name)')
-    ap.add_argument('--csv', metavar='DIR', help='folder with the clint_rules_*.csv and clint_cycles_*.csv files of many '
-                    'participants: draws clint_class.png instead of the run figures')
+    ap.add_argument('--align', action='store_true',
+                    help='start all runs at the same time (for runs that were made at different times)')
+    ap.add_argument('--csv', metavar='DIR', help='folder with the clint_rules_*.csv and clint_cycles_*.csv files of '
+                    'many participants, instead of work folders')
     args = ap.parse_args(argv)
+    os.makedirs(args.out, exist_ok=True)
 
     if args.csv:
         rules, cycles = load_csv_class(args.csv)
         if not rules and not cycles:
             print(f'Error: no clint_rules_*.csv or clint_cycles_*.csv in {args.csv}', file=sys.stderr)
             return 1
-        os.makedirs(args.out, exist_ok=True)
+        if args.align:
+            align_starts(rules, cycles)
         path = os.path.join(args.out, 'clint_class.png')
-        plot_class(rules, cycles, path)
+        plot_summary(rules, cycles, path)
         print(path)
         return 0
 
@@ -535,7 +436,6 @@ def main(argv=None):
     labels = args.label or [os.path.basename(os.path.abspath(f)) for f in args.folders]
     if len(set(labels)) != len(labels):
         ap.error('the labels must differ: use --label')
-
     runs = {}
     for folder, label in zip(args.folders, labels):
         links = load_run(folder)
@@ -546,16 +446,13 @@ def main(argv=None):
     if not runs:
         print('Error: nothing to plot', file=sys.stderr)
         return 1
-
-    os.makedirs(args.out, exist_ok=True)
-    for label, links in runs.items():
-        path = os.path.join(args.out, f'clint_run_{label}.png')
-        plot_run(links, label, path)
-        print(path)
-    if len(runs) > 1:
-        path = os.path.join(args.out, 'clint_compare.png')
-        plot_compare(runs, path)
-        print(path)
+    rules, cycles = rows_from_ledgers(runs)
+    if args.align:
+        align_starts(rules, cycles)
+    first = next(iter(runs))
+    path = os.path.join(args.out, f'clint_run_{first}.png' if len(runs) == 1 else 'clint_class.png')
+    plot_summary(rules, cycles, path, label=first if len(runs) == 1 else '')
+    print(path)
     return 0
 
 

@@ -43,6 +43,8 @@ def _cmd_plot(args):
     argv = list(args.folders) + ['--out', args.out]
     if args.csv:
         argv += ['--csv', args.csv]
+    if args.align:
+        argv.append('--align')
     if args.label:
         argv += ['--label'] + list(args.label)
     return clint_plot.main(argv)
@@ -202,6 +204,7 @@ def _build_parser():
     plot_parser.add_argument('--out', default='.', help='folder for the PNG files (default: the current folder)')
     plot_parser.add_argument('--label', nargs='*', help='one name per folder (default: the folder name)')
     plot_parser.add_argument('--csv', metavar='DIR', help='folder with the CSV files of many participants (clint_class.png)')
+    plot_parser.add_argument('--align', action='store_true', help='start all runs at the same time')
     plot_parser.set_defaults(func=_cmd_plot)
 
     export_parser = sub.add_parser('export', help='Write the metrics of a run to two CSV files, to hand in')

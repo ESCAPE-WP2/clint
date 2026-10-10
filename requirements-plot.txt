@@ -1,3 +1,4 @@
 # Optional: only for "python cli.py plot" / clint_plot.py. Not part of requirements.txt,
 # so that a rucio client (for example the RBAC fork) is never replaced by an install of this file.
 matplotlib
+mplhep
